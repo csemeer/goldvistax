@@ -1,0 +1,1084 @@
+# Aurum Intelligence — Production Enhancement Addendum
+## Live Gold Market Data Integrity, Provider/Broker Configuration, Platform Health and Multi-Channel Notifications
+
+**Document type:** Mandatory addendum to the existing Aurum Intelligence master `PROMPT.md`  
+**Applies to:** The already-built application and its existing repository  
+**Priority:** Critical production-correctness enhancement  
+**Primary objectives:** Correct the currently inaccurate gold prices; reliably obtain the latest available market data from authorized sources; make providers and broker connections configurable; expose transparent data freshness and application health; and deliver configurable status, incident, and advisory alerts through Telegram and other supported channels.
+
+---
+
+# 1. Mission and non-negotiable outcomes
+
+The application is already built, but the gold rates displayed by the application are currently incorrect. Treat this as a production data-integrity defect, not a cosmetic UI issue.
+
+Inspect the existing repository, reproduce the defect, trace the full data path, identify the root cause, implement the fix, and validate it end to end. Do not simply replace one hard-coded number, adjust the UI, or add another price endpoint while leaving conflicting data paths in place.
+
+Deliver a reliable market-data subsystem that:
+1. Retrieves the latest available data for the explicitly selected gold instrument from a configured, authorized and technically suitable provider.
+2. Distinguishes live, delayed, indicative, snapshot, stale, cached, frozen, unavailable and simulated data.
+3. Shows the source, instrument identity, quote type, source timestamp, receive timestamp, freshness, currency, units, and connection state.
+4. Never labels delayed, cached, stale, estimated or unverified data as “live”.
+5. Supports a free/default provider configuration where technically and legally appropriate, while allowing users to configure other providers and eligible broker market-data connections.
+6. Supports failover only between compatible instruments and data products; never silently blend unrelated prices.
+7. Offers configurable alerts for application health, data quality, provider failures, and advisory events via Telegram and other supported channels.
+8. Preserves the existing application architecture and reuses canonical services rather than creating parallel implementations.
+9. Provides tests, observability, diagnostics, migration notes, operator instructions and a clear acceptance report.
+10. Remains advisory-only unless a separately approved future change explicitly introduces order execution. This addendum does not authorize live trading or order placement.
+
+**Critical principle:** A price that is numerically plausible is not necessarily correct. Correctness requires verified instrument identity, source provenance, units, timestamps, quote semantics and data-quality checks.
+
+---
+
+# 2. First action: assess the existing application before changing it
+
+Before implementing anything, inspect the complete repository and document the actual current design.
+
+## 2.1 Repository assessment
+
+Identify:
+- Frontend framework, backend framework, application entry points and runtime/deployment model.
+- Current price source(s), libraries, endpoints, API keys, symbol mappings and polling/subscription mechanisms.
+- All locations that retrieve, transform, cache, store, calculate, display or publish gold prices.
+- Existing market-data adapters, domain models, caches, background workers, event bus, WebSocket/SSE channels and scheduled tasks.
+- Current use of Yahoo Finance, `yfinance`, broker APIs, public endpoints, static fixtures, demo data, mock services or hard-coded fallback values.
+- Current symbol used for “gold”, such as XAU/USD spot, a broker-specific XAUUSD contract, a COMEX futures contract, a gold ETF, or a CFD quote.
+- Whether a displayed value is bid, ask, midpoint, last trade, settlement, close, indicative reference price or a calculated conversion.
+- Timezone assumptions, timestamp parsing, polling intervals, cache TTLs, retry logic, stale-data handling and UI refresh behaviour.
+- Duplicate price-fetching logic across dashboard cards, charts, technical indicators, strategies, reports, AI agents, notifications and APIs.
+- Existing secrets/configuration handling and current test coverage.
+
+Search the codebase for all references to gold symbols, quote fields, price endpoints, provider names, “live”, “real-time”, timestamps, caches and fallback values. Trace one price from its upstream source all the way to every user-facing consumer.
+
+## 2.2 Produce a concise defect report
+
+Before or alongside implementation, record:
+- The exact observed incorrect value and the intended instrument.
+- The provider and endpoint currently used.
+- The upstream response received, with credentials and sensitive headers removed.
+- The normalized value and every transformation applied.
+- The displayed value and its source timestamp.
+- The most likely root cause and the evidence supporting it.
+- Whether the cause is a wrong symbol, stale cache, delayed feed, wrong field, incorrect unit/currency, timezone issue, parsing bug, inverted conversion, bad fallback, duplicate state, or another issue.
+- The corrective change and regression tests.
+
+Do not invent a root cause. Prove it with code inspection, captured sanitized responses and repeatable tests.
+
+## 2.3 Preserve existing working features
+
+Do not rewrite the application from scratch. Reuse and improve the existing module boundaries. If the repository already has an appropriate market-data service, extend it rather than creating a second service with overlapping responsibilities.
+
+Before adding a dependency, provider adapter, database table, background worker or configuration screen, check whether the capability already exists.
+
+---
+
+# 3. Define the instrument correctly before requesting a quote
+
+“Gold price” is ambiguous. Different legitimate instruments can have different prices.
+
+## 3.1 Canonical instrument identity
+
+Introduce or improve one canonical `InstrumentDefinition` model, with fields such as:
+- `instrument_id`: stable internal identifier.
+- `display_name`.
+- `asset_class`.
+- `instrument_type`: for example `spot`, `future`, `etf`, `cfd`, `physical_reference` or another explicitly supported type.
+- `base_currency` and `quote_currency`.
+- `price_currency`.
+- `price_unit`, for example USD per troy ounce.
+- `quantity_unit`.
+- `provider_symbol` and `provider_instrument_id`, stored as provider-specific mappings rather than universal truth.
+- `exchange`, `venue` or `pricing_venue`, where applicable.
+- `contract_month`, expiry, roll policy and contract multiplier for futures.
+- `is_primary`, `is_enabled` and supported timeframes.
+- Instrument-specific market-hours and calendar metadata, where relevant.
+
+Do not assume that every provider uses the same ticker or contract identifier. Maintain explicit provider-to-canonical instrument mappings.
+
+## 3.2 Separate common gold instruments
+
+At minimum, support clear, separate configuration for:
+- **XAU/USD spot or spot-like reference:** a price quoted in USD per troy ounce from a provider that explicitly supports that product.
+- **Gold futures:** a specific exchange-listed futures contract, with exchange, contract month, expiry and roll rules clearly identified.
+- **Broker-specific gold instruments:** for example, a broker's XAUUSD or metal contract, only after the actual instrument definition has been verified.
+- **Gold ETFs or mining equities:** separate instruments; never use them as a substitute for spot gold.
+- **Physical-gold local retail rates:** if supported later, identify location, purity, currency, unit, premium, tax and timestamp separately.
+
+Never silently substitute a futures price, ETF price, previous close or physical retail rate for XAU/USD spot. If a requested product is not available from the selected provider, show that limitation and ask the user to choose a compatible product/provider.
+
+## 3.3 Explicit quote semantics
+
+Define a canonical `MarketQuote` schema containing, where available:
+- Canonical instrument ID and provider instrument ID.
+- Bid, ask, last/mark price and midpoint as separate fields.
+- The primary displayed price and a required `price_type` describing what it represents.
+- Price currency and unit.
+- Source event timestamp, source timezone if supplied, ingestion/receive timestamp in UTC, and last-successful-refresh timestamp.
+- Provider, endpoint/product identifier, feed type and source status.
+- Live/delayed/indicative/snapshot/frozen/cached/simulated classification.
+- Staleness/freshness duration.
+- Market/session status, if known.
+- Quality flags, validation result and optional confidence/availability metadata.
+- A provenance/correlation ID suitable for logs and diagnostics.
+
+Use decimal-safe numeric handling for prices and monetary calculations. Avoid binary floating-point rounding errors in financial values where exact decimal semantics are required. Validate values before they reach indicators, strategies, reports or alerts.
+
+---
+
+# 4. Market-data provider strategy
+
+## 4.1 Provider-neutral architecture
+
+Create or strengthen a single market-data domain service that all application features use.
+
+Suggested logical interfaces (adapt naming to the existing codebase):
+
+- `MarketDataProvider`
+  - `get_capabilities()`
+  - `health_check()`
+  - `resolve_instrument(...)`
+  - `get_quote(...)`
+  - `get_historical_bars(...)`
+  - `subscribe_quotes(...)`, if supported
+  - `close()` / lifecycle cleanup
+- `MarketDataRegistry` — registers available adapters and their capabilities.
+- `InstrumentResolver` — resolves canonical instruments into provider-specific symbols/contracts.
+- `MarketDataRouter` — selects the configured primary source and eligible fallback source.
+- `QuoteNormalizer` — normalizes provider payloads into the canonical schema.
+- `QuoteQualityValidator` — checks timestamp, numeric values, identity, currency, units, spread and anomalies.
+- `FreshnessPolicy` — applies instrument- and feed-specific freshness thresholds.
+- `MarketDataCache` — stores only validated, provenance-preserving data.
+- `MarketDataHealthService` — exposes provider status, lag, failures and recovery.
+- `MarketDataAuditService` — records source transitions and important quality decisions.
+
+These are responsibilities, not a requirement to create a class for every name. Follow the repository’s conventions and avoid needless abstractions. There must be one authoritative path for quote acquisition, normalization, quality control and publication.
+
+## 4.2 Free/default source policy
+
+Provide a simple default configuration suitable for a developer or individual user who wants to get started without paying for a premium feed, **only where the provider's terms, access method and instrument coverage permit the intended use**.
+
+Yahoo Finance may be offered as an optional default/reference source if it currently supports the selected instrument and the chosen access method is permitted. However:
+- Do not assume Yahoo Finance provides real-time data for every instrument.
+- Do not assume all Yahoo tickers are spot gold.
+- Do not label a quote real-time merely because it was fetched successfully.
+- Treat third-party libraries such as `yfinance` as implementation dependencies, not official guarantees of service availability, latency, completeness, licensing or stability.
+- Check the selected symbol, quote fields, timestamp and provider metadata.
+- Do not bypass access controls, rate limits, authentication or provider restrictions.
+- Do not redistribute data in ways prohibited by the source's terms.
+
+The UI must describe the configured source honestly, for example:
+- “Yahoo Finance reference — delayed/latency not guaranteed”
+- “Broker feed — live, subscription verified”
+- “Cached quote — last successful update 2m 14s ago”
+- “Historical close — market closed”
+- “Price unavailable — provider returned no valid quote”
+
+Use exact labels based on observed capability and metadata, not hard-coded marketing language.
+
+## 4.3 Authorized sources and source selection
+
+Create a provider catalogue that describes for each provider:
+- Supported instruments and symbol mappings.
+- Spot/futures/ETF/CFD coverage, as actually verified.
+- Quote types and data fields available.
+- Real-time, delayed, snapshot or historical availability.
+- Authentication and required account permissions.
+- Whether paid market-data subscriptions may be required.
+- Streaming versus polling capability.
+- Rate limits, request quotas and retry guidance.
+- Historical depth and timeframe constraints.
+- Licensing, display and redistribution restrictions.
+- Geographic/account eligibility restrictions where relevant.
+- Current health and last successful request.
+- Documentation URL and the date the integration was last verified.
+
+Do not assume that an API is free, authorized for redistribution, real-time or suitable for the user's product simply because it is publicly reachable.
+
+The implementation must consult the provider's current official documentation and terms during development. Store provider-specific details in configuration/adapter code, not throughout business logic.
+
+## 4.4 Candidate providers and adapters
+
+Implement the default provider and any additional adapter only after confirming its current product coverage and access conditions. Design adapters for future additions such as:
+- Yahoo Finance or a compatible permitted access method for supported reference quotes.
+- Interactive Brokers (IBKR) market data through an appropriate supported API.
+- Alpaca market data only for instruments/products that Alpaca explicitly supports; do not presume it provides the required XAU/USD spot or CFD feed.
+- Other licensed market-data APIs selected by the user.
+- A manually configured reference source only if its provenance and limitations can be represented honestly.
+
+Do not implement empty “integrations” that merely display a connected badge. Every enabled adapter must pass a real health check and an instrument-specific quote test.
+
+## 4.5 Broker connectivity is not the same as market-data entitlement
+
+Design broker connections as optional, separately configurable adapters. A broker login does not automatically guarantee live data for every instrument or account.
+
+### Interactive Brokers
+- Support the applicable official API, subject to current IBKR requirements and the user's account/session model.
+- Make the API mode and connection endpoint configurable.
+- Handle contract discovery/qualification, market-data permissions, delayed versus live responses, session status, pacing limits, reconnects and subscription lifecycle.
+- Do not assume every precious-metal instrument is available to every account.
+- Expose subscription/permission failures as actionable status messages.
+- Do not request trading permissions or place orders for this advisory-only enhancement.
+
+### Alpaca
+- Verify current API capabilities, asset coverage, market-data products, entitlements and instrument availability from official documentation before implementation.
+- Do not assume that Alpaca supports XAU/USD spot or a gold CFD merely because it supports other asset classes.
+- If the required gold instrument is unsupported, show it as unavailable for that adapter rather than substituting an unrelated instrument.
+- Keep any supported equity, ETF or other gold-related asset separate from spot gold.
+
+### Future brokers/providers
+- Use the same provider contract and canonical quote schema.
+- Store credentials securely.
+- Keep connection status, market-data entitlement status and trading capability as distinct concepts.
+- Do not enable order submission under this addendum.
+
+## 4.6 Provider configuration and routing
+
+Allow the user to configure:
+- Primary provider.
+- Primary provider's instrument mapping.
+- Optional fallback provider and its instrument mapping.
+- Data mode: `automatic`, `streaming_if_available`, `polling`, `snapshot`, `delayed_allowed` or other clearly defined modes.
+- Whether delayed data is acceptable.
+- Whether cached data may be shown, and how it must be labelled.
+- Per-provider enable/disable state.
+- Provider-specific refresh interval within documented rate limits.
+- Freshness thresholds and stale-data action.
+- Broker/API connection settings and connection test.
+- Historical-data provider, if different from the live-quote provider.
+
+A fallback is eligible only if it serves the same canonical instrument and compatible quote semantics. Do not automatically fall back from spot to futures or ETF. If only an incompatible source remains, return `DATA_UNAVAILABLE` for the requested instrument and present the alternate instrument as a separate choice.
+
+Use a predictable routing policy:
+1. Read configured provider priority and instrument capability.
+2. Verify provider readiness and entitlement.
+3. Fetch or consume the quote.
+4. Normalize and validate it.
+5. Evaluate freshness and quote semantics.
+6. Publish only if it passes the configured policy.
+7. If invalid, try an eligible fallback and record why.
+8. If no valid quote exists, expose a clear unavailable/stale state; do not manufacture a price.
+
+---
+
+# 5. Freshness, reliability and failover
+
+## 5.1 Freshness policy
+
+Implement explicit freshness rules per instrument, provider and feed type. Do not use one universal hard-coded threshold for every instrument.
+
+Each quote must be classified into a state such as:
+- `LIVE`: provider and feed metadata support live status and the quote meets freshness policy.
+- `DELAYED`: provider indicates delayed data or delay is known.
+- `INDICATIVE`: the source explicitly supplies a reference/indicative price rather than a tradable quote.
+- `SNAPSHOT`: one-time quote with no continuous-stream guarantee.
+- `CACHED`: last valid quote retained from an earlier successful retrieval.
+- `STALE`: age exceeds the allowed threshold.
+- `FROZEN`: source explicitly indicates a frozen/last-session quote.
+- `SIMULATED`: test or simulation data.
+- `UNAVAILABLE`: no valid quote can be provided.
+- `UNKNOWN`: feed semantics or timestamp cannot be verified.
+
+Never infer `LIVE` solely from a recent local fetch timestamp. A stale upstream quote can be fetched repeatedly.
+
+## 5.2 Timestamp handling
+
+- Store timestamps in UTC internally.
+- Display in the user's selected timezone, with the timezone label visible.
+- Preserve the source timestamp and local receive timestamp separately.
+- Handle missing, malformed, future, out-of-order and timezone-naive timestamps defensively.
+- Reject or flag impossible timestamps and excessive clock skew.
+- Calculate quote age from the most trustworthy source timestamp available.
+- If the provider does not supply enough metadata to verify freshness, classify conservatively as `UNKNOWN` or `INDICATIVE` rather than claiming real-time status.
+
+## 5.3 Failover and cache rules
+
+- Use bounded timeouts, exponential backoff with jitter, circuit breakers and retry budgets.
+- Respect provider rate limits and `Retry-After` responses.
+- Do not retry indefinitely or block the UI while providers are unavailable.
+- Use cached data only when policy allows it; visibly label the value and its age.
+- Keep the last valid quote separate from the latest attempted request.
+- Do not overwrite a valid newer quote with an older response from a slow request.
+- Guard against out-of-order events and duplicate updates.
+- Record provider failover, recovery and data-quality rejections.
+- Apply hysteresis or a controlled recovery policy to prevent source flapping.
+- If provider A and provider B disagree beyond a configurable, instrument-aware tolerance, flag a discrepancy and avoid silent averaging. Do not average prices from different instruments or quote semantics.
+- Make it possible to configure “fail closed”: suppress new recommendations if current data is missing, stale, incompatible or unverified.
+
+## 5.4 Market-hours awareness
+
+Gold-related products do not all share the same market hours. The app must distinguish a legitimate market closure from a feed failure.
+
+For the configured instrument, display session status when reliable calendar information is available. When the market is closed:
+- Label the last valid quote and timestamp.
+- Do not call it a live current price.
+- Do not treat lack of movement as proof of a disconnected provider.
+- Keep the health of the connection separate from the freshness of the instrument's price.
+
+---
+
+# 6. Data-quality controls and price correctness
+
+Build one reusable validation pipeline that runs before data reaches any consumer.
+
+## 6.1 Validation checks
+
+Validate:
+- Canonical instrument and provider symbol.
+- Expected currency and unit.
+- Positive and finite prices.
+- Bid/ask consistency when both exist.
+- Negative, zero, null, NaN, infinity and malformed numeric values.
+- Timestamp validity, ordering and age.
+- Duplicate messages and out-of-order updates.
+- Unusually large price jumps or spreads, using configurable robust thresholds.
+- Stale values repeatedly returned as if fresh.
+- Currency conversion direction and conversion timestamp where conversion is used.
+- Price precision and rounding rules.
+- Futures contract expiry/roll continuity when futures are supported.
+- Provider response schema changes.
+- Source-to-source discrepancies for genuinely comparable quotes.
+
+A suspicious jump must not automatically be discarded if it may be a real market event. Mark it as anomalous, compare independent evidence if configured, and apply a transparent policy. All thresholds must be instrument-aware and configurable.
+
+## 6.2 No silent corrections
+
+Do not silently “fix” a provider quote by applying an unexplained multiplier, offset, conversion or symbol substitution. Every transformation must be explicit, documented, testable and auditable.
+
+If USD per troy ounce is converted to another unit/currency, use a named conversion service and a timestamped FX rate. Show the original quote and converted quote as separate values with the formula and conversion provenance available in diagnostics.
+
+## 6.3 Downstream consistency
+
+All of the following must consume the same validated canonical data service:
+- Live price card and overview dashboard.
+- Price chart and candles.
+- Technical indicators and multi-timeframe analysis.
+- Strategies, entry/exit levels and risk calculations.
+- AI agents and market commentary.
+- Backtests, clearly separated from live data.
+- Reports, downloadable exports and historical event analysis.
+- Telegram/Discord/Slack/email/webhook notifications.
+- API endpoints and status screens.
+
+No page, agent or alert may call a provider directly or independently calculate a conflicting “current gold price” outside the canonical service. Provider-specific code belongs inside its adapter.
+
+---
+
+# 7. Historical bars, indicators and analysis integrity
+
+The current-price fix must not leave charts or recommendations using a different or inconsistent source.
+
+## 7.1 Canonical bars
+
+Create or improve a normalized `MarketBar` schema with:
+- Instrument ID and timeframe.
+- Open, high, low, close, volume where meaningful.
+- Bar start/end timestamps in UTC.
+- Source and data classification.
+- Final/closed versus provisional/in-progress status.
+- Quality flags and provenance.
+
+Validate OHLC relationships, duplicate bars, missing intervals, timestamp alignment, timezone boundaries and session calendars. Do not invent volume for spot products when the provider does not supply it. Do not interpret tick count as exchange volume unless the provider defines it that way.
+
+## 7.2 One calculation engine
+
+Use one canonical indicator engine and one canonical candle/bar normalization layer for charts, strategies, AI agents, reports and alerts. Do not let a UI chart library and a backend strategy independently calculate slightly different indicators without an explicit reason.
+
+Record which source and bars were used to calculate a signal. A signal generated from delayed or stale data must be labelled accordingly or suppressed by policy.
+
+## 7.3 Recommendation gating
+
+Before issuing a new advisory:
+- Confirm instrument identity.
+- Confirm data quality and freshness are acceptable for the advisory's timeframe.
+- Confirm required candles/indicators are sufficiently complete.
+- Check whether a major provider/source transition has just occurred.
+- Verify that risk and entry/exit calculations use the same instrument and currency.
+- Include the quote timestamp and price provenance in the recommendation's evidence.
+- Return `WAIT`, `NO TRADE` or `INSUFFICIENT DATA` when minimum data requirements are not met.
+
+Do not backfill live gaps with historical closes and then pretend the result is current. If historical bars are used for context, keep their timestamps and classification explicit.
+
+---
+
+# 8. User interface: market-data transparency and controls
+
+Create a polished, responsive “Market Data & Connections” area consistent with the existing design system. Do not create a separate visual language.
+
+## 8.1 Gold price card
+
+The primary gold price card should show:
+- Instrument name and type, e.g. `XAU/USD Spot Reference`.
+- Price and currency/unit, e.g. `USD / troy oz`.
+- Price type: bid, ask, midpoint, last, mark or reference.
+- Provider name and data classification badge.
+- Source timestamp and “received/updated” timestamp.
+- Human-readable age, e.g. `Updated 4 seconds ago`.
+- Connection/health state.
+- Market session state if known.
+- Change and percentage change only when the comparison basis is known.
+- A clear stale, delayed, unavailable or simulated banner when applicable.
+
+Avoid using green “LIVE” indicators unless live status is verified by provider metadata/capability and freshness checks. Use both text and visual status so meaning is not conveyed by colour alone.
+
+## 8.2 Provider configuration screen
+
+Include:
+- Provider list/cards with enabled state, supported instrument types, current health and entitlement state.
+- Primary source selector.
+- Optional fallback selector with compatibility validation.
+- Canonical instrument and provider-symbol mapping editor.
+- Live/delayed/indicative/snapshot support labels.
+- Refresh interval and freshness policy settings.
+- “Test connection”, “Test quote”, “Refresh now” and “View diagnostics” actions.
+- Last successful quote, last error, last transition and latency.
+- Secure credential input with masked values.
+- “Clear credential” and “rotate credential” actions where applicable.
+- A warning when a selected provider cannot supply the requested instrument.
+- A warning when live data requires a subscription, permission, or provider plan.
+
+A successful API authentication must not automatically show “Live data connected”. Distinguish `Authenticated`, `Instrument supported`, `Market data permission verified`, `Receiving valid quote`, and `Quote fresh`.
+
+## 8.3 Diagnostics panel
+
+For an authorized user, provide a safe diagnostic view showing:
+- Configured primary and fallback sources.
+- Canonical instrument mapping.
+- Provider status and recent latency.
+- Latest source timestamp, receive timestamp and age.
+- Last error category and redacted message.
+- Retry/backoff/circuit-breaker status.
+- Recent source switches and data-quality rejections.
+- Whether a recommendation is currently blocked due to data quality.
+- A copyable, sanitized diagnostic report.
+
+Never expose API keys, bot tokens, passwords, authorization headers, session cookies, full account identifiers or other secrets in the UI, logs or exported diagnostics.
+
+## 8.4 Responsive and accessible behaviour
+
+Support desktop, tablet and mobile layouts. Make status text readable, controls keyboard accessible, labels explicit and error messages actionable. Avoid a dashboard full of decorative green dots that mask the actual data state.
+
+---
+
+# 9. Configuration, secrets and deployment
+
+## 9.1 Configuration hierarchy
+
+Use a predictable hierarchy, adapted to the existing project:
+1. Safe application defaults.
+2. Environment variables or deployment secrets.
+3. Persisted user settings for non-secret preferences.
+4. Encrypted secret storage for credentials.
+5. Runtime validation and explicit precedence rules.
+
+Do not commit real API keys or tokens. Provide `.env.example` with placeholder names only. If configuration is missing, the application should start in a safe degraded state and explain what is missing instead of crashing or silently using fake prices.
+
+Example configuration categories (names are illustrative; align with existing naming conventions):
+
+```dotenv
+# Market-data routing
+MARKET_DATA_PRIMARY_PROVIDER=yahoo_reference
+MARKET_DATA_FALLBACK_PROVIDER=
+MARKET_DATA_ALLOW_DELAYED=true
+MARKET_DATA_ALLOW_CACHED=true
+MARKET_DATA_MAX_STALE_SECONDS=60
+MARKET_DATA_REQUEST_TIMEOUT_SECONDS=8
+MARKET_DATA_POLL_INTERVAL_SECONDS=15
+
+# Instrument identity
+GOLD_INSTRUMENT_ID=xau_usd_spot_reference
+GOLD_PRICE_CURRENCY=USD
+GOLD_PRICE_UNIT=troy_ounce
+
+# IBKR (optional; use only supported current official API configuration)
+IBKR_ENABLED=false
+IBKR_API_MODE=
+IBKR_HOST=
+IBKR_PORT=
+IBKR_CLIENT_ID=
+
+# Alpaca (optional; only for verified supported instruments)
+ALPACA_ENABLED=false
+ALPACA_API_KEY=
+ALPACA_API_SECRET=
+ALPACA_DATA_FEED=
+
+# Telegram (optional)
+TELEGRAM_ENABLED=false
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+
+# General notifications
+NOTIFICATIONS_ENABLED=true
+NOTIFICATION_DEDUPE_WINDOW_SECONDS=300
+NOTIFICATION_MAX_RETRIES=5
+```
+
+These are illustrative names and conservative example values, not a universal configuration contract. Select defaults based on the actual provider limits, the application architecture, user requirements and verified instrument capabilities. Do not make a 15-second polling interval a reason to claim the upstream feed itself is real-time.
+
+## 9.2 Credential management
+
+- Prefer environment/deployment secrets or an appropriate secret manager.
+- Encrypt persisted credentials at rest where the application supports user-managed provider settings.
+- Never store secrets in browser local storage unless a documented, reviewed design makes this unavoidable.
+- Never send provider credentials to the frontend.
+- Redact secrets from exceptions, logs, telemetry, crash reports and support bundles.
+- Apply least privilege and separate market-data-only access from any trading permission.
+- Support credential rotation and safe connection revalidation.
+- Document how to revoke a leaked credential.
+- Do not collect a broker password if the official API provides a safer authorization/session mechanism.
+
+## 9.3 Startup and configuration validation
+
+At startup and whenever a provider setting changes:
+- Validate configuration shape.
+- Validate provider enabled/disabled state.
+- Resolve the instrument mapping.
+- Validate that the provider can serve the required instrument.
+- Verify connectivity and entitlement without placing orders.
+- Report actionable status for missing credentials, unsupported symbols, invalid configuration and unavailable services.
+- Keep the rest of the application usable when optional providers are not configured.
+
+---
+
+# 10. Telegram and multi-channel notifications
+
+Build a reusable notification subsystem. It must support both market/advisory messages and operational/app-status messages without duplicating formatting, routing, retry logic or delivery records.
+
+## 10.1 Architecture
+
+Create or extend the following responsibilities within the existing architecture:
+- `NotificationService` — application-facing entry point.
+- `NotificationEvent` — canonical event schema.
+- `NotificationTemplateRegistry` — shared message templates and versioning.
+- `NotificationPolicy` — severity, user preferences, quiet hours, deduplication and rate limits.
+- `NotificationRouter` — maps event types and severity to configured destinations.
+- `NotificationChannel` interface — provider-neutral delivery contract.
+- Channel adapters — Telegram, Discord, Slack, email, generic HTTPS webhook and any additional channel only when its API, access and terms have been verified.
+- `NotificationDeliveryRepository` — delivery state and retry metadata.
+- `NotificationHealthService` — channel connectivity and delivery monitoring.
+
+These names are guidance, not a mandate to over-engineer. Use the existing module system and implement each capability once.
+
+## 10.2 Telegram adapter
+
+Implement Telegram using the official Bot API:
+- Configurable bot token and destination chat/channel ID.
+- Explicit setup instructions for creating a bot and obtaining the destination chat ID.
+- Connection/test-message action.
+- Separate notification categories and destination routing if the configuration supports multiple chats.
+- Message templates for application status, provider failure/recovery, stale data, quote anomalies and advisory signals.
+- Safe handling of Telegram rate limits, timeouts, network failures and API errors.
+- Message length handling, escaping/formatting rules and safe links.
+- Delivery result recording and retry with bounded exponential backoff and jitter.
+- Deduplication and rate limiting to prevent notification floods.
+- Optional quiet hours and user timezone.
+- Clear “configured”, “tested”, “enabled” and “delivery healthy” states.
+
+Never include the bot token in message content, UI output, logs or exception text. Treat the bot token like a password. A test must send a real test message only after the user explicitly clicks the test action or enables the channel.
+
+## 10.3 Additional notification channels
+
+Use the same channel contract for:
+- Discord incoming webhooks.
+- Slack incoming webhooks or supported official app/bot integrations.
+- Email via a configurable SMTP service or supported email provider.
+- Generic HTTPS webhooks with configurable URL, authentication and payload schema.
+- Other channels (for example WhatsApp or mobile push) only as optional future adapters after reviewing current official API requirements, costs, account approval, template rules and regional availability.
+
+Do not claim that a channel is ready merely because its configuration form exists. Each enabled adapter must have a real integration test and clear operational status.
+
+## 10.4 Notification event catalogue
+
+Support configurable notification rules for at least the following:
+
+### Application lifecycle
+- Application started successfully.
+- Application stopped gracefully, where a shutdown event can be reliably sent.
+- Application version/deployment changed.
+- Background worker started, stopped or failed.
+- Scheduled job failed or recovered.
+- Database/cache or required dependency became unavailable or recovered.
+
+### Market-data operations
+- Primary provider disconnected or authentication failed.
+- Instrument mapping unsupported or invalid.
+- Live-data entitlement/subscription missing.
+- Valid quote received after startup.
+- Quote became stale.
+- Quote became unavailable.
+- Fallback provider activated.
+- Primary provider recovered and passed validation.
+- Data source changed.
+- Source discrepancy exceeds threshold.
+- Timestamp, unit, currency, spread or price anomaly detected.
+- Market/session opened or closed, when reliable calendar data exists.
+- Repeated rate-limit response or provider quota warning.
+- Data quality restored after an incident.
+
+### Advisory events
+- New validated bullish/bearish/neutral advisory.
+- Advisory updated, invalidated or expired.
+- Entry trigger reached, if this alert is explicitly enabled.
+- Stop/target level touched based on validated data, if enabled.
+- `WAIT`, `NO TRADE` or `INSUFFICIENT DATA` status when useful and enabled.
+- Major scheduled macroeconomic event approaching, if calendar source and timezone are validated.
+- A high-priority risk warning or recommendation suppression.
+
+Do not emit an advisory signal just because the price changed. Follow the canonical recommendation engine, data-quality gates and notification policy.
+
+## 10.5 Notification content standards
+
+A price/advisory notification should include, when relevant:
+- Instrument name/type.
+- Observed price and price type.
+- Currency/unit.
+- Provider and data classification.
+- Source timestamp and quote age.
+- Direction/status and timeframe.
+- Entry/stop/targets only if generated by the approved advisory engine.
+- Risk/reward assumptions and invalidation conditions.
+- Short explanation and link to the relevant app screen/report.
+- Unique event ID and generated-at timestamp.
+- Clear statement if data is delayed, stale, indicative or otherwise limited.
+
+Never send a stale or unverified price in a message that labels it as current. If a source becomes stale, send a data-quality/availability alert rather than a fabricated market update.
+
+## 10.6 Severity, routing and noise control
+
+Provide event severity levels such as:
+- `INFO`
+- `SUCCESS`
+- `WARNING`
+- `ERROR`
+- `CRITICAL`
+
+Allow users to configure by event category:
+- Enable/disable.
+- Destination channel(s).
+- Severity threshold.
+- Quiet hours and timezone.
+- Cooldown/deduplication window.
+- Maximum messages per time interval.
+- Escalation after repeated failures.
+- Recovery notification behaviour.
+- Whether routine advisories should be grouped into a digest.
+
+Operational incidents such as invalid data or loss of feed may need immediate delivery even during quiet hours, depending on user policy. Do not hard-code this exception without an explicit setting.
+
+Avoid repeated messages for the same incident. Prefer “incident opened”, periodic summary if configured, and “incident recovered” over sending an alert on every polling cycle.
+
+## 10.7 Delivery reliability
+
+- Persist notification events before delivery where practical.
+- Use a durable queue/outbox pattern if the existing stack supports it and reliability requirements justify it.
+- Track `pending`, `sent`, `failed`, `retry_scheduled`, `suppressed` and `dead_letter` states.
+- Use bounded retries and exponential backoff with jitter.
+- Respect provider-specific rate limits.
+- Make retries idempotent where possible.
+- Record destination, attempt count, timestamps, provider response category and sanitized error.
+- Do not retry permanent errors forever.
+- Provide a dead-letter/review view for unresolved deliveries.
+- Ensure a notification-channel failure does not crash market-data processing or the UI.
+- Avoid recursive alert loops in which notification failure generates unlimited notifications about notification failure.
+
+---
+
+# 11. Application status and observability
+
+Build a centralized health/status model so the UI and notification system agree about the actual application state.
+
+## 11.1 Status categories
+
+Report independent status for:
+- Frontend availability.
+- Backend/API availability.
+- Database and cache.
+- Background workers/scheduler.
+- Primary market-data provider.
+- Fallback provider.
+- Canonical instrument resolution.
+- Live quote receipt and quote freshness.
+- Historical-bar availability.
+- AI/model services, if used.
+- Notification subsystem.
+- Each configured notification channel.
+- Configuration validity and required credentials.
+
+Do not compress all these into one green “System healthy” indicator if a critical subsystem is broken.
+
+## 11.2 Health endpoints
+
+Provide appropriate endpoints consistent with the existing backend, for example:
+- `/health/live`: process is running.
+- `/health/ready`: critical dependencies are ready for the requested operational mode.
+- `/health`: concise overall summary.
+- `/api/market-data/status`: provider and quote freshness details.
+- `/api/notifications/status`: configured channel and delivery health.
+
+These routes are examples. Reuse existing routing conventions and avoid exposing sensitive configuration. Health endpoints must have defined semantics and tests. Public endpoints should not expose internal exception messages, credentials, account identifiers or detailed infrastructure information.
+
+## 11.3 Structured logs and metrics
+
+Add structured logs with correlation IDs and safe fields for:
+- Provider requests and response outcomes.
+- Request latency and retry count.
+- Quote ingestion and validation.
+- Source switches and fallback activation.
+- Quote age and data lag.
+- Invalid payloads and schema changes.
+- Notification enqueue/send/retry/failure.
+- Application lifecycle and background-job health.
+
+Recommended metrics include:
+- `market_data_request_total` by provider/outcome.
+- `market_data_request_latency_seconds`.
+- `market_data_quote_age_seconds`.
+- `market_data_quote_validation_failure_total` by safe reason code.
+- `market_data_provider_switch_total`.
+- `market_data_last_success_timestamp`.
+- `notification_delivery_total` by channel/status.
+- `notification_delivery_latency_seconds`.
+- `notification_retry_total`.
+- `background_job_failure_total`.
+
+Use the project's existing observability stack if available. Avoid high-cardinality labels such as raw payloads, tokens, chat IDs or user-entered URLs. Never log full credentials or sensitive payloads.
+
+## 11.4 Operational status notifications
+
+Support configurable startup, shutdown, provider-disconnected, provider-recovered, stale-data, worker-failure, scheduled-job-failure and notification-channel-failure messages.
+
+A shutdown message cannot be guaranteed after a sudden power loss, process kill or network failure. Document that limitation; use an external heartbeat/watchdog if reliable crash detection is required.
+
+---
+
+# 12. Data persistence, cache and audit history
+
+Use existing persistence mechanisms where possible. Avoid duplicate tables or overlapping cache implementations.
+
+Persist, as appropriate:
+- Latest validated quote by canonical instrument and provider.
+- Quote snapshots needed for charting/audit and permitted by provider terms.
+- Normalized historical bars and their provenance.
+- Provider health transitions.
+- Instrument mapping and provider capability verification metadata.
+- User provider preferences.
+- Encrypted credentials or references to secrets.
+- Notification preferences and destination configuration.
+- Notification events and delivery attempts.
+- Source discrepancy events and data-quality incidents.
+- Application version/configuration changes that materially affect outputs.
+
+Define retention, cleanup and migration policies. Respect provider storage/redistribution restrictions. Do not persist every raw payload indefinitely by default. Preserve enough sanitized evidence to debug wrong prices without storing secrets.
+
+Cached data must retain its original source timestamp and classification. Re-fetching a cached record must not reset its quote age.
+
+---
+
+# 13. Security, privacy and compliance
+
+Apply:
+- Least-privilege access to provider and broker credentials.
+- Secure secret storage and rotation.
+- Encryption in transit.
+- Appropriate encryption at rest.
+- Authentication and authorization for configuration and diagnostics.
+- CSRF protection where relevant to the chosen web architecture.
+- Input validation and safe URL handling for webhook configuration.
+- SSRF protections for user-configurable webhook destinations, including private/link-local address restrictions and redirect validation where applicable.
+- Egress allow-listing where practical.
+- Rate limits on connection tests and manual refresh actions.
+- Audit trail for provider, credential and notification configuration changes.
+- Redaction of secrets and personal information.
+- Dependency vulnerability checks.
+- Secure error messages that do not leak internals.
+
+For broker integration, separate market-data permissions from trading permissions. This addendum must not activate order placement, position modification, account funding or other brokerage transactions.
+
+Treat gold analysis and alerts as decision support, not a guarantee of performance or a substitute for the user's own judgement. Make the data source, freshness and limitations visible. Review data-provider terms, licensing, exchange display rules and any applicable legal obligations before using the application commercially or redistributing market data.
+
+---
+
+# 14. Error handling and user-facing recovery
+
+Map technical failures into useful, non-misleading states, for example:
+- `PROVIDER_AUTH_FAILED`
+- `PROVIDER_RATE_LIMITED`
+- `PROVIDER_TIMEOUT`
+- `PROVIDER_UNAVAILABLE`
+- `INSTRUMENT_UNSUPPORTED`
+- `INSTRUMENT_MAPPING_INVALID`
+- `LIVE_ENTITLEMENT_REQUIRED`
+- `QUOTE_MISSING`
+- `QUOTE_STALE`
+- `QUOTE_TIMESTAMP_INVALID`
+- `QUOTE_CURRENCY_MISMATCH`
+- `QUOTE_UNIT_MISMATCH`
+- `QUOTE_ANOMALOUS`
+- `SOURCE_DISAGREEMENT`
+- `NOTIFICATION_AUTH_FAILED`
+- `NOTIFICATION_RATE_LIMITED`
+- `NOTIFICATION_DELIVERY_FAILED`
+- `CONFIGURATION_INVALID`
+
+Each error must have:
+- A stable machine-readable code.
+- A safe user-facing explanation.
+- An operator diagnostic detail with secrets removed.
+- A retryability classification.
+- A recommended corrective action.
+- A correlation ID for troubleshooting.
+
+Never show a plausible hard-coded price as a substitute for an unavailable source. If a demo mode exists, label it unmistakably as simulated and keep it separate from live/advisory mode.
+
+---
+
+# 15. Test plan: prove the fix, not just the connection
+
+Build a repeatable automated test suite around the current defect and the new capabilities.
+
+## 15.1 Unit tests
+
+Test:
+- Instrument mapping and quote type.
+- Currency and unit normalization.
+- Decimal-safe price handling.
+- Timestamp parsing and UTC conversion.
+- Freshness classification.
+- Provider status transitions.
+- Fallback eligibility and rejection.
+- Stale-cache behaviour.
+- Out-of-order and duplicate quote handling.
+- Invalid numeric values and malformed payloads.
+- Bid/ask and spread validation.
+- Anomaly detection.
+- Rate-limit and retry policy.
+- Notification routing, templates and deduplication.
+- Notification severity and quiet-hour rules.
+- Secret redaction.
+- Advisory suppression when data is invalid or stale.
+
+## 15.2 Contract tests for every provider adapter
+
+Use sanitized recorded fixtures or controlled mocks for:
+- Successful valid quote.
+- Valid delayed quote.
+- Missing timestamp.
+- Invalid or unsupported symbol.
+- No market-data entitlement.
+- Authentication failure.
+- Rate-limit response.
+- Timeout/network outage.
+- Schema change or unexpected payload.
+- Null/zero/negative/infinite price.
+- Provider returns an older timestamp than the stored quote.
+- Provider returns an instrument or currency different from the requested one.
+- Recovery after outage.
+
+Where a live integration test is used, make it opt-in, bounded, non-destructive and safe for CI. Do not require production credentials in normal unit-test runs.
+
+## 15.3 Integration and end-to-end tests
+
+Prove that:
+1. The configured provider returns the intended instrument.
+2. The normalized quote preserves correct price, currency, unit, price type, timestamps and provenance.
+3. The backend API exposes that same validated quote.
+4. The frontend displays the same value and accurate freshness label.
+5. Charts and downstream analysis consume the canonical source.
+6. A stale or invalid quote blocks new advisory generation according to policy.
+7. Provider failure produces an accurate status and, if configured, one deduplicated operational alert.
+8. Fallback occurs only for a compatible instrument.
+9. Recovery is detected and the user is notified if configured.
+10. Telegram and any other enabled channel can deliver a real test message.
+11. Secrets are not visible in UI, logs, API responses or diagnostic exports.
+12. Restart/redeployment restores configuration and provider state safely.
+13. A notification service outage does not break price ingestion or the dashboard.
+14. Demo/backtest data can never be mistaken for live data.
+
+## 15.4 Golden tests and consistency tests
+
+Create fixed, version-controlled fixtures with known instrument identity, quote semantics, timestamp, currency and expected normalized values. Verify that dashboard, chart, alert and recommendation consumers use the same canonical quote and calculation path.
+
+Do not use a golden fixture to claim that the current live market price equals that fixture. Fixtures prove code behaviour, not current market truth.
+
+## 15.5 Manual acceptance checklist
+
+Document a repeatable operator procedure:
+- Configure a permitted default provider.
+- Select the intended instrument.
+- Test connection.
+- Test quote retrieval.
+- Confirm source and timestamp.
+- Compare with the provider's own displayed quote for the same instrument and quote type.
+- Verify any known provider delay.
+- Test stale-data and provider-outage behaviour.
+- Configure a fallback and confirm compatibility checks.
+- Configure Telegram and send a user-initiated test message.
+- Trigger a controlled simulated incident and recovery.
+- Confirm the app labels every state correctly.
+- Confirm no trading orders are submitted.
+
+---
+
+# 16. Performance and resilience requirements
+
+- Use asynchronous I/O where appropriate to the existing framework.
+- Set explicit connection and response timeouts.
+- Avoid blocking UI requests while waiting for a provider.
+- Use a shared ingestion task or streaming subscription rather than having every browser tab independently poll the upstream provider.
+- Coalesce equivalent in-flight requests where appropriate.
+- Apply caching with explicit TTL and original timestamps.
+- Respect provider limits and terms.
+- Avoid unbounded worker queues and memory growth.
+- Reconnect streaming clients with bounded backoff and jitter.
+- Ensure subscriptions are not duplicated after reconnect or page refresh.
+- Prevent a slow provider from blocking a healthy provider.
+- Apply circuit breakers where justified and expose their state.
+- Make manual refresh actions safe to repeat.
+- Document expected resource usage and operational limits.
+
+Polling interval, source update frequency and source latency are separate values. A browser refreshing every second does not make a source that updates every minute real-time.
+
+---
+
+# 17. Implementation sequence
+
+Work in controlled, testable phases. Do not skip the defect investigation.
+
+## Phase 1 — Reproduce and diagnose
+- Inspect repository and current source.
+- Reproduce the incorrect rate.
+- Trace symbol, payload, transformations, cache and UI.
+- Identify root cause and document it.
+- Add a failing regression test where feasible.
+
+## Phase 2 — Canonical instrument and quote contract
+- Confirm the intended default gold instrument.
+- Define canonical instrument identity and quote schema.
+- Correct symbol mappings, units, currency, timestamps and price type.
+- Remove or isolate any unsafe hard-coded/mock fallback.
+
+## Phase 3 — Canonical market-data service
+- Implement or repair provider adapters and routing.
+- Add normalization, quality checks, freshness rules and provenance.
+- Implement cache semantics, bounded retries and eligible fallback.
+- Ensure every consumer uses this service.
+
+## Phase 4 — User configuration and status UI
+- Add Market Data & Connections.
+- Add provider selection, instrument mapping, connection/quote tests and diagnostics.
+- Add explicit live/delayed/stale/cached/unavailable labels.
+- Add actionable error states.
+
+## Phase 5 — Optional broker adapters
+- Verify current official API capabilities and account requirements.
+- Implement only adapters that support the selected product.
+- Verify market-data permissions and live/delayed status.
+- Keep all brokerage operations read-only under this addendum.
+
+## Phase 6 — Notification engine
+- Implement shared event, policy, routing, template, delivery and retry components.
+- Implement Telegram.
+- Add other channels only where required and supported.
+- Add configuration UI, test actions, status and delivery history.
+- Wire application, market-data and advisory events into the shared notification engine.
+
+## Phase 7 — Observability and security
+- Add health endpoints, metrics, structured logs and sanitized diagnostics.
+- Review secret storage, access controls, SSRF protection and audit history.
+- Document alerting limitations and provider licensing assumptions.
+
+## Phase 8 — Verification and release
+- Run all existing tests and new tests.
+- Run lint, type checks, static analysis and dependency/security checks supported by the project.
+- Run end-to-end and manual acceptance tests.
+- Review UI responsiveness and accessibility.
+- Provide the defect report, test results, configuration guide, release notes and known limitations.
+
+If time or scope requires staged delivery, prioritize correct price identity, source provenance, freshness, safe failure and consistent downstream use before adding extra channels or nonessential UI polish.
+
+---
+
+# 18. Definition of done / acceptance criteria
+
+The work is not complete until the following are demonstrated:
+
+### Market data
+- [ ] The original incorrect-price defect has a documented, evidence-based root cause.
+- [ ] The default configured source can retrieve a valid quote for the explicitly selected instrument using a permitted access method.
+- [ ] The app does not confuse spot gold, futures, ETFs, CFDs or physical retail rates.
+- [ ] The displayed quote includes price type, currency/unit, provider, source timestamp and age.
+- [ ] Live/delayed/indicative/snapshot/cached/stale/unavailable states are represented accurately.
+- [ ] A successful HTTP response alone cannot mark a quote live.
+- [ ] Stale or invalid quotes cannot silently enter new recommendations.
+- [ ] All downstream consumers use the canonical validated market-data service.
+- [ ] Fallback never silently substitutes an incompatible instrument.
+- [ ] Provider outage results in a clear unavailable/degraded state, not a fake price.
+
+### Configuration and broker connections
+- [ ] Provider configuration is editable and validated.
+- [ ] Unsupported instrument mappings are clearly rejected.
+- [ ] Optional broker adapters are disabled by default and are only enabled after capability and entitlement verification.
+- [ ] Missing live-data entitlement is shown honestly.
+- [ ] Secrets are stored and redacted safely.
+- [ ] No orders or brokerage transactions are submitted.
+
+### Notifications
+- [ ] Telegram can be configured and tested end to end.
+- [ ] Other enabled channels have real, tested adapters.
+- [ ] App-status, data-quality, provider transition and advisory notifications can be enabled/disabled by category.
+- [ ] Routing, severity, quiet hours, deduplication, rate limits and retries work as configured.
+- [ ] Failed delivery is visible and does not break market-data processing.
+- [ ] Recovery events are sent according to policy.
+- [ ] No notification presents stale/unverified data as live.
+
+### Quality and operations
+- [ ] Unit, adapter contract, integration and regression tests pass.
+- [ ] Existing features remain functional.
+- [ ] No duplicate quote logic or duplicate notification pipeline has been introduced.
+- [ ] Health/status screens and diagnostic logs agree with actual runtime state.
+- [ ] Configuration, setup, troubleshooting, licensing caveats and known limitations are documented.
+- [ ] The final report identifies changed files/modules, test commands and results, setup steps, remaining gaps and release recommendation.
+
+A checklist item must not be marked complete merely because code exists. It requires a test, observable evidence or a documented reason why the item is not applicable.
+
+---
+
+# 19. Required deliverables
+
+Provide:
+1. **Root-cause report** explaining why the current price was wrong.
+2. **Architecture delta** describing existing components reused and any new components added.
+3. **Provider capability matrix** for implemented sources, including instrument coverage, quote semantics, delay/entitlement status, official documentation, limitations and verification date.
+4. **Configuration guide** for default provider, optional provider/broker setup, instrument mapping, freshness and failover settings.
+5. **Telegram setup guide** plus setup/test guidance for any other implemented channel.
+6. **Data integrity and operational runbook** for stale prices, provider failures, source discrepancy, credential expiry and notification failure.
+7. **Automated test report** with exact commands and outcomes.
+8. **UI screenshots or equivalent evidence** of valid, delayed, stale, unavailable and recovered states, where the environment supports capture.
+9. **Security review notes** covering secret handling, webhook security and broker read-only scope.
+10. **Release notes** and remaining limitations.
+11. **Updated `.env.example` or equivalent sample configuration** containing placeholders only.
+12. **Updated architecture/module ownership documentation** so future work does not reimplement provider logic or notifications.
+
+---
+
+# 20. Developer execution instructions
+
+Act as the senior engineering team responsible for fixing an existing production-facing application.
+
+1. Start by inspecting the repository, tests, runtime configuration and current market-data flow.
+2. Reproduce the wrong price and prove its root cause.
+3. Read the current official provider/API documentation and terms for each integration you intend to implement. Do not rely on outdated snippets or unverified third-party claims.
+4. Make the smallest sound architectural changes that fully solve the problem.
+5. Reuse the existing market-data, domain, persistence, UI, event and configuration components wherever appropriate.
+6. Keep provider-specific logic inside adapters and use one canonical quote schema and validation path.
+7. Keep notification formatting, routing, delivery and retries in one shared notification subsystem.
+8. Do not invent provider capabilities, market prices, entitlements or successful delivery.
+9. Do not silently substitute an instrument or claim that delayed data is live.
+10. Do not use hard-coded values or mocks in production mode. Any demo mode must be unmistakably labelled and technically isolated.
+11. Do not expose secrets or enable live order execution.
+12. Add tests before claiming the defect is fixed.
+13. Run the actual project test, lint, type-check and build commands; report real results, including failures.
+14. Update documentation and configuration examples alongside the implementation.
+15. End with a concise implementation summary: root cause, files/modules changed, source selected and why, observed quote classification, provider/broker setup, notification setup, test results, known limitations and recommended next step.
+
+**Final engineering principle:** one canonical instrument identity, one validated market-data pipeline, one honest freshness model, one reusable notification engine, and transparent operational status across the entire application.

@@ -1,0 +1,6 @@
+{
+  "name": "Aurum Intelligence",
+  "description": "AI-powered gold market intelligence, research, quantitative strategy, chart analysis, and trading advisory platform for XAU/USD.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
