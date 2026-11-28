@@ -41,6 +41,15 @@
 | **DEC-031** | 2026-11-15 | Stale/Invalid Advisory Abstention (§4.4), 8-Check Gate (§7.5), Golden AI Eval Harness (§7.6) & HMAC Session/Tenant Isolation (§6.1–6.2) | Security, AI & Core Leads | **ACCEPTED** |
 | **DEC-032** | 2026-11-15 | Client HMAC Token Refresh, FRED DFII10 Live Real-Yield Ingestion, Graceful Shutdown & Interactive AI Eval UI | Security, Macro & Frontend Leads | **ACCEPTED** |
 | **DEC-033** | 2026-11-15 | PostgreSQL Persistence Repositories (`001` DDL), Background Fundamentals Scheduler & Strict `ALLOWED_ORIGINS` CORS Guard | Platform, Security & Data Leads | **ACCEPTED** |
+| **DEC-034** | 2026-11-15 | Idempotent SQL Migration Runner, Phase 9 Server Paper Journal Persistence & OIDC JWKS / CSP Hardening | Platform & Security Leads | **ACCEPTED** |
+| **DEC-035** | 2026-11-15 | Live OHLC Forecast Outcome Evaluator, Dynamic Scorecard Merger, Expanded AI Guards & Client OIDC PKCE Contract | Forecast, AI & Security Leads | **ACCEPTED** |
+| **DEC-036** | 2026-11-15 | Live Scorecard UI Sync, In-Frame Export, OIDC PKCE Token Exchange, Iframe CSP Compatibility & Full GAP-05 Copy Reconciliation | Frontend & Security Leads | **ACCEPTED** |
+| **DEC-037** | 2026-11-15 | App OIDC PKCE Callback Loop, Notification RBAC Error Surfacing & Final GAP-05 Checkout/Plan Card Cleanup | Frontend & Compliance Leads | **ACCEPTED** |
+| **DEC-038** | 2026-11-15 | Market Data / LLM Settings Error Surfacing, Paywall Copy Harmonization & Institutional Icon Cleanup | Frontend & Compliance Leads | **ACCEPTED** |
+| **DEC-039** | 2026-11-15 | Notification Webhook URL Masking, Prometheus OpenMetrics Exporter & Modal WCAG Dialog Accessibility | Security, Ops & Frontend Leads | **ACCEPTED** |
+| **DEC-040** | 2026-11-15 | PRO RBAC & Rate Limiting on Diagnostic Test Endpoints + `aurum_auth_denied_total` Telemetry | Security & Ops Leads | **ACCEPTED** |
+| **DEC-041** | 2026-11-15 | Early `dotenv/config` Boot Hydration, Placeholder Guarding, Extended Secret Redaction & Environment Setup Guide | Platform & Security Leads | **ACCEPTED** |
+| **DEC-042** | 2026-11-16 | Dynamic Multi-Horizon Directional Advisory Engine (`BUY`/`SELL`/`HOLD`/`NO_TRADE`) & Delayed Quote `allowDelayed` Classification | Quant, Advisory & Market Data Leads | **ACCEPTED** |
 
 ---
 
@@ -494,6 +503,22 @@
 - **Context:** While `/api/market-data/config`, `/api/notifications/config`, and `/api/llm/settings` enforced `requireServerRole('PRO')`, their sibling outbound diagnostic probes (`/api/market-data/test-connection`, `/api/notifications/test`, `/api/llm/test`) lacked server RBAC and rate-limit guards, exposing upstream quote/webhook/Gemini quota to unauthenticated callers; additionally `serverMetrics` lacked a dedicated 401/403 authorization-denial counter.
 - **Decision:** Enforced `requireServerRole('PRO')` + `applySensitiveRateLimit` across all three diagnostic test endpoints (with client bearer forwarding already verified in `MarketDataConfigWorkspace`, `NotificationSettingsWorkspace`, `LLMSettingsWorkspace`), redacted 500 error strings on `/api/notifications/test`, added `authDeniedCount` / `aurum_auth_denied_total` to `/api/metrics` & `/api/metrics/prometheus`, and reconciled `OBSERVABILITY_AND_ALERTING.md`.
 - **Status:** Implemented & Verified (`Test 22` in `tests/monetization.test.ts`; **65 / 65** passing).
+
+---
+
+### DEC-041: Early `dotenv/config` Boot Hydration, Placeholder Guarding, Extended Secret Redaction & Environment Setup Guide
+- **Date:** 2026-11-15
+- **Context:** Operators populating `.env` (`GEMINI_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `EIA_API_KEY`, `FRED_API_KEY`, `MARKET_DATA_*`) needed an authoritative step-by-step setup guide, `MARKET_DATA_*` / `TELEGRAM_*` / `WEBHOOK_URL` values were not hydrated into singleton services at server boot, `dotenv.config()` ran after top-level store-path constants evaluated, unreplaced `.env.example` placeholder strings could trigger false `oidcConfigured` / `STRIPE_WEBHOOK_SECRET` states in non-prod sandboxes, and `redactSensitiveLogValue()` lacked masks for Telegram `bot<id>:<token>` and Gemini `AQ.*` prefixes.
+- **Decision:** Authored `docs/operations/ENVIRONMENT_VARIABLES_SETUP_GUIDE.md` covering all 22 requested + companion variables; moved `import 'dotenv/config'` to the top of `server.ts`; added `isTemplatePlaceholderValue()`, `buildEnvHydrationConfigs()`, and expanded `redactSensitiveLogValue()` in `serverSecurity.ts`; wired automatic boot hydration + placeholder-safe readiness flags (`eiaConfigured`, `fredConfigured`, `telegramConfigured`) in `server.ts`; and verified live FRED `DFII10` + EIA v2 sync (`Test 39`; **66 / 66** passing).
+- **Status:** Implemented & Verified (`Test 39` in `tests/multiCommodity.test.ts`; **66 / 66** passing).
+
+---
+
+### DEC-042: Dynamic Multi-Horizon Directional Advisory Engine (`BUY`/`SELL`/`HOLD`/`NO_TRADE`) & Delayed Quote `allowDelayed` Classification
+- **Date:** 2026-11-16
+- **Context:** `advisoryEngine.ts` previously hardcoded `direction: 'BUY'`, `BUY_CONFIRMED`/`STRONG_BULLISH` states, static bullish specialist prose, and strictly bullish stop/target geometry (`stop < entry < target1`), causing all horizons and `DecisionIntelligenceEngine` outputs to emit `BUY` even during sustained negative short-term trends. Additionally, `MarketDataRouter.getQuote` ignored `config.allowDelayed` when Yahoo Finance COMEX quotes carried normal ~10-minute exchange latency (`~614s`), misclassifying healthy delayed weekday quotes as `STALE` and forcing spurious `NO_TRADE` holds and HTTP `422` publication rejections.
+- **Decision:** Rebuilt `advisoryEngine.ts` (`v1.5.0-DYN-DIR`) with deterministic `assessHorizonDirectionalSignal()` scoring across `EMA9`/`EMA21`/`EMA50`, multi-bar candle slope, `IndicatorSnapshot` (`supertrend`, `macd.histogram`, `rsi14`), and `change24hPct` (`>= +15 -> BUY`, `<= -15 -> SELL`, `(-15, +15) -> HOLD`, stale/crossed/quality-held -> `NO_TRADE`); added `buildDirectionalLevels()` mirroring stop/target geometry and R:R math for `SELL` and `HOLD`; updated `getEvidenceRegistry()` and `getSpecialistAgents()` dynamically; wired live candle/indicator feeds into `App.tsx`, `server.ts` (`/api/advisory/plans`, `/api/advisory/agents`, `/api/decision/scan`), and `decisionIntelligenceEngine.ts` (plus regime-direction conflict fallback to `HOLD`); updated `TradePlanCard.tsx` (`HOLD / WAIT` badge, hidden execute action on non-directional plans) and `ReportsWorkspace.tsx`; and honored `config.allowDelayed` (`ageSeconds < 900 -> DEGRADED`) in `MarketDataRouter.getQuote`.
+- **Status:** Implemented & Verified (`Test 40` in `tests/multiCommodity.test.ts`; **67 / 67** passing; live `XAUUSD` `-0.65%` verified emitting `SELL`).
 
 
 

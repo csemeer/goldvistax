@@ -218,7 +218,7 @@ export function evaluateInstrumentDecision(
   const candles = options.candles ?? generateCandleHistory('1h', 80, quote.mid);
   const regimeState = classifyMarketRegimeFromSeries(candles, quote.quality);
 
-  const plans = generateTradePlans(quote);
+  const plans = generateTradePlans(quote, { candles, quote });
   const selectedPlan = plans[horizon] || plans.SWING;
 
   const spreads = calculateCrossCommoditySpreads(allQuotes);
@@ -231,7 +231,7 @@ export function evaluateInstrumentDecision(
       : undefined
   );
 
-  const agents = getSpecialistAgents(quote.mid);
+  const agents = getSpecialistAgents(quote.mid, { candles, quote });
   const consensus = evaluateCouncilConsensus(agents);
   const councilVetoed = Boolean(options.forceCouncilVeto) || consensus.adversarialVetoActive;
 
@@ -298,6 +298,11 @@ export function evaluateInstrumentDecision(
     direction = 'INSUFFICIENT_EVIDENCE';
   } else if (triggeredGates.length > 0) {
     direction = 'NO_TRADE';
+  } else if (
+    (regimeState.regime === 'BEARISH_TREND' && direction === 'BUY') ||
+    (regimeState.regime === 'BULLISH_TREND' && direction === 'SELL')
+  ) {
+    direction = 'HOLD';
   }
 
   // Transparent deterministic weighted ranking (no opaque AI score)
@@ -384,14 +389,16 @@ export interface OpportunityScannerResult {
 
 export function runOpportunityScanner(
   allQuotes: Record<string, Quote>,
-  horizon: AdvisoryHorizon = 'SWING'
+  horizon: AdvisoryHorizon = 'SWING',
+  candlesByInstrument?: Partial<Record<InstrumentId, Candle[]>>
 ): OpportunityScannerResult {
   const targets: InstrumentId[] = ['XAUUSD', 'XAGUSD', 'WTI_CRUDE', 'BRENT_CRUDE'];
   const decisions = targets
     .map((id) => {
       const q = allQuotes[id];
       if (!q) return null;
-      return evaluateInstrumentDecision(id, q, allQuotes, { horizon });
+      const candles = candlesByInstrument?.[id];
+      return evaluateInstrumentDecision(id, q, allQuotes, { horizon, candles });
     })
     .filter((d): d is CanonicalDecisionObject => d !== null)
     .sort((a, b) => b.deterministicRankScore - a.deterministicRankScore);

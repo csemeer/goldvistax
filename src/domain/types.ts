@@ -369,6 +369,7 @@ export type BacktestTrade = BacktestRunResult['trades'][number];
 export interface PaperPosition {
   id: string;
   tradePlanId: string;
+  advisoryHorizon?: AdvisoryHorizon;
   instrumentId: InstrumentId;
   direction: 'BUY' | 'SELL';
   lots: number;
@@ -376,9 +377,12 @@ export interface PaperPosition {
   currentPrice: number;
   stopLoss: number;
   takeProfit: number;
+  adverseExtremePrice?: number;
+  favorableExtremePrice?: number;
   unrealizedPnl: number;
   realizedPnl: number;
   openTime: string;
+  closeTime?: string;
   status: 'OPEN' | 'CLOSED_PROFIT' | 'CLOSED_LOSS' | 'CANCELLED';
   notes: string;
 }
@@ -386,7 +390,15 @@ export interface PaperPosition {
 export interface AlertRule {
   id: string;
   name: string;
-  conditionType: 'PRICE_LEVEL' | 'RSI_THRESHOLD' | 'SPREAD_SPIKE' | 'EVENT_COUNTDOWN';
+  conditionType:
+    | 'PRICE_LEVEL'
+    | 'RSI_THRESHOLD'
+    | 'SPREAD_SPIKE'
+    | 'EVENT_COUNTDOWN'
+    | 'ATR_VOLATILITY'
+    | 'CORRELATION_DEVIATION'
+    | 'YIELD_CORRELATION_BREAKOUT'
+    | 'GSCI_COMMODITY_CORRELATION';
   targetValue: number;
   comparison: 'ABOVE' | 'BELOW' | 'EQUALS';
   horizon: AdvisoryHorizon;

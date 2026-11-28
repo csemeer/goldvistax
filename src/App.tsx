@@ -4,20 +4,31 @@
  * Aurum Intelligence — Master Gold Trading Advisory & Market Intelligence Platform
  */
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
+  AdvisoryHorizon,
   Candle,
   IndicatorSnapshot,
+  PaperPosition,
   Quote,
   Timeframe,
   TradePlan,
 } from './domain/types';
 import { Navbar } from './components/Navbar';
 import { Sidebar, WorkspaceId } from './components/Sidebar';
-import { CandleChart } from './components/CandleChart';
+import {
+  CandleChart,
+  getGlobalSmartAnnotationEnabled,
+  setGlobalSmartAnnotationEnabled,
+} from './components/CandleChart';
 import { TradePlanCard } from './components/TradePlanCard';
+import {
+  StrategyBiasRationaleModal,
+  StrategyBiasRationalePanel,
+} from './components/StrategyBiasRationalePanel';
 import { CFDCalculator } from './components/CFDCalculator';
 import { CrossCommoditySpreadsPanel } from './components/CrossCommoditySpreadsPanel';
+import { TradeVolumeProfileWidget } from './components/TradeVolumeProfileWidget';
 import { MacroWorkspace } from './components/MacroWorkspace';
 import { StrategyLabWorkspace } from './components/StrategyLabWorkspace';
 import { BacktestingWorkspace } from './components/BacktestingWorkspace';
@@ -25,8 +36,10 @@ import { CouncilWorkspace } from './components/CouncilWorkspace';
 import { ReportsWorkspace } from './components/ReportsWorkspace';
 import { AlertsWorkspace } from './components/AlertsWorkspace';
 import { PortfolioJournalWorkspace } from './components/PortfolioJournalWorkspace';
+import { PerformanceInsightsWorkspace } from './components/PerformanceInsightsWorkspace';
 import { MarketDataConfigWorkspace } from './components/MarketDataConfigWorkspace';
 import { NotificationSettingsWorkspace } from './components/NotificationSettingsWorkspace';
+import { StrategyAlertFeedWidget } from './components/StrategyAlertFeedWidget';
 import { GeminiChatbot } from './components/GeminiChatbot';
 import { NewsSentimentWorkspace } from './components/NewsSentimentWorkspace';
 import { HistoricalScenariosWorkspace } from './components/HistoricalScenariosWorkspace';
@@ -37,6 +50,8 @@ import { PaywallGateModal } from './components/PaywallGateModal';
 import { AuthModal } from './components/AuthModal';
 import { AccessGateGuard } from './components/AccessGateGuard';
 import { LandingPage } from './components/LandingPage';
+import { WorkspaceErrorBoundary } from './components/WorkspaceErrorBoundary';
+import { CommandPaletteModal, PortfolioSubTabId } from './components/CommandPaletteModal';
 import {
   UserSession,
   UserRole,
@@ -44,12 +59,23 @@ import {
   saveSession,
   canAccessWorkspace,
   switchPersona,
+  updateCurrentUserTier,
   logoutUser,
   DEMO_PERSONAS,
   enrollNewCustomer,
   refreshSignedSandboxToken,
   completeOidcPkceCallback,
+  ensureSignedBearerToken,
 } from './services/authService';
+import {
+  getBrowserPushPermission,
+  loadUserTradeAlerts,
+  markAllTradeAlertsRead,
+  requestBrowserPushPermission,
+  TradeLifecycleAlertEvent,
+  formatTradeAlertHeadline,
+} from './services/tradeAlertService';
+import { getInstrumentMultiplierForMae } from './services/portfolioScannerEngine';
 import {
   UserEntitlementState,
   loadUserEntitlements,
@@ -77,7 +103,17 @@ import {
   HISTORICAL_EVENT_STUDIES,
   findHistoricalAnalogs,
 } from './services/macroData';
-import { getQuantitativeStrategies, QUANTITATIVE_STRATEGIES } from './services/strategyEngine';
+import {
+  getQuantitativeStrategies,
+  QUANTITATIVE_STRATEGIES,
+  evaluateAllSubscribedStrategyAlerts,
+  buildChronologicalStrategyAlertFeed,
+  createTradePlanFromFeedEntry,
+  StrategyAlertFeedEntry,
+  StrategyAlertHistoryItem,
+  StrategyAlertSubscription,
+  StrategyEntryEvaluation,
+} from './services/strategyEngine';
 import {
   EVIDENCE_REGISTRY,
   SPECIALIST_AGENTS,
@@ -105,6 +141,8 @@ import {
   Maximize2,
   Minimize2,
   RotateCcw,
+  BookOpen,
+  BellRing,
 } from 'lucide-react';
 
 export default function App() {
@@ -122,7 +160,10 @@ export default function App() {
   const [isRefreshingQuotes, setIsRefreshingQuotes] = useState<boolean>(false);
   const [selectedPlanForCFD, setSelectedPlanForCFD] = useState<TradePlan | null>(null);
   const [selectedPlanForPaper, setSelectedPlanForPaper] = useState<TradePlan | null>(null);
+  const [selectedPlanForPaperLots, setSelectedPlanForPaperLots] = useState<number | null>(null);
   const [selectedStrategyForBacktest, setSelectedStrategyForBacktest] = useState<string>('STRAT-01-MACRO-TREND');
+  const [overviewRationaleHorizon, setOverviewRationaleHorizon] = useState<AdvisoryHorizon>('SHORT_TERM');
+  const [rationaleModalHorizon, setRationaleModalHorizon] = useState<AdvisoryHorizon | null>(null);
 
   // User Identity, Enrollment & Access Control (RBAC) State
   const [userSession, setUserSession] = useState<UserSession>(() => getCurrentSession());
@@ -148,8 +189,10 @@ export default function App() {
     return true; // Default to landing page on initial load!
   });
 
-  // Commercial Entitlements & Monetization State
-  const [entitlements, setEntitlements] = useState<UserEntitlementState>(() => loadUserEntitlements());
+  // Commercial Entitlements & Monetization State (Strictly scoped per userSession.uid)
+  const [entitlements, setEntitlements] = useState<UserEntitlementState>(() =>
+    loadUserEntitlements(userSession.uid)
+  );
   const [checkoutItem, setCheckoutItem] = useState<{
     type: 'PACK' | 'TIER';
     id: string;
@@ -175,6 +218,53 @@ export default function App() {
     show: false,
     message: '',
   });
+  const [strategyPushToast, setStrategyPushToast] = useState<{
+    show: boolean;
+    title: string;
+    message: string;
+  }>({
+    show: false,
+    title: '',
+    message: '',
+  });
+  const [strategyAlertHistory, setStrategyAlertHistory] = useState<StrategyAlertHistoryItem[]>([]);
+  const firedStrategyAlertKeysRef = useRef<Set<string>>(new Set());
+  const strategyToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [tradeAlerts, setTradeAlerts] = useState<TradeLifecycleAlertEvent[]>(() =>
+    loadUserTradeAlerts(userSession.uid)
+  );
+  const [browserPushPermission, setBrowserPushPermission] = useState<NotificationPermission | 'unsupported'>(() =>
+    getBrowserPushPermission()
+  );
+  const [tradeAlertToast, setTradeAlertToast] = useState<{
+    show: boolean;
+    title: string;
+    message: string;
+    positionId?: string;
+    eventType?: 'TRADE_OPENED' | 'TRADE_CLOSED';
+  }>({
+    show: false,
+    title: '',
+    message: '',
+  });
+  const tradeToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [strategySubscriptions, setStrategySubscriptions] = useState<Record<string, StrategyAlertSubscription>>(() => {
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        const session = getCurrentSession();
+        const raw = window.localStorage.getItem(`aurum_strategy_alert_subs_v1:${session.uid || 'guest'}`);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            return parsed;
+          }
+        }
+      }
+    } catch {
+      // ignore storage read issues
+    }
+    return {};
+  });
 
   const handlePeriodChange = (newPeriod: HistoricalRangePeriod) => {
     setHistoricalPeriod(newPeriod);
@@ -187,11 +277,54 @@ export default function App() {
 
   // Responsive & Fit-to-Screen Controllable UI State
   const [isFitToScreen, setIsFitToScreen] = useState<boolean>(true);
+  const [smartAnnotationsEnabled, setSmartAnnotationsEnabled] = useState<boolean>(() =>
+    getGlobalSmartAnnotationEnabled()
+  );
+  const handleToggleGlobalSmartAnnotations = useCallback((enabled: boolean) => {
+    setGlobalSmartAnnotationEnabled(enabled);
+    setSmartAnnotationsEnabled(enabled);
+  }, []);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState<boolean>(false);
+  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState<boolean>(false);
+  const [requestedPortfolioTab, setRequestedPortfolioTab] = useState<PortfolioSubTabId | null>(null);
+  const [requestedPortfolioPositionId, setRequestedPortfolioPositionId] = useState<string | null>(null);
+  const [userPortfolioPositions, setUserPortfolioPositions] = useState<PaperPosition[]>([]);
+  const [chartSetupJump, setChartSetupJump] = useState<{
+    entry: StrategyAlertFeedEntry;
+    plan: TradePlan;
+  } | null>(null);
   const [layoutMode, setLayoutMode] = useState<'AUTO' | 'TERMINAL' | 'SPLIT'>('AUTO');
   const [showTradePlanDock, setShowTradePlanDock] = useState<boolean>(true);
   const [showMacroTickers, setShowMacroTickers] = useState<boolean>(true);
+
+  // Global Keyboard Shortcuts: Ctrl+B / Cmd+B (Sidebar), Ctrl+K / Cmd+K (Quick Jump), / (Quick Jump outside inputs)
+  useEffect(() => {
+    const handleGlobalShortcuts = (e: KeyboardEvent) => {
+      if (isLandingPageActive) return;
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && e.key.toLowerCase() === 'b') {
+        e.preventDefault();
+        setIsSidebarCollapsed((prev) => !prev);
+        return;
+      }
+      if (mod && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setIsCommandPaletteOpen((prev) => !prev);
+        return;
+      }
+      if (e.key === '/' && !mod && !e.altKey) {
+        const target = e.target as HTMLElement | null;
+        const tag = target?.tagName;
+        if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && !target?.isContentEditable) {
+          e.preventDefault();
+          setIsCommandPaletteOpen(true);
+        }
+      }
+    };
+    window.addEventListener('keydown', handleGlobalShortcuts);
+    return () => window.removeEventListener('keydown', handleGlobalShortcuts);
+  }, [isLandingPageActive]);
 
   const primaryInstrument = getPrimaryInstrumentForCommodity(currentCommodity);
   const primaryInstrumentId = primaryInstrument.id;
@@ -205,7 +338,10 @@ export default function App() {
   const [candles, setCandles] = useState<Candle[]>(initialHistory.visibleCandles);
   const [indicators, setIndicators] = useState<IndicatorSnapshot>(initialHistory.currentIndicatorSnapshot);
   const [tradePlans, setTradePlans] = useState<Record<string, TradePlan>>(() =>
-    generateTradePlans(quotes[primaryInstrumentId] || quotes['XAUUSD'])
+    generateTradePlans(quotes[primaryInstrumentId] || quotes['XAUUSD'], {
+      candles: initialHistory.visibleCandles,
+      indicators: initialHistory.currentIndicatorSnapshot,
+    })
   );
 
   // Apply dark mode class to root html element
@@ -251,10 +387,15 @@ export default function App() {
         };
         saveSession(oidcSession);
         setUserSession(oidcSession);
-        setEntitlements((prev) => ({
-          ...prev,
+        const scopedEnt = loadUserEntitlements(oidcSession.uid);
+        const syncedEnt: UserEntitlementState = {
+          ...scopedEnt,
           tier: result.role === 'ALPHA' ? 'ALPHA' : result.role === 'PRO' ? 'PRO' : 'FREE',
-        }));
+        };
+        saveUserEntitlements(syncedEnt, oidcSession.uid);
+        setEntitlements(syncedEnt);
+        setSelectedPlanForPaper(null);
+        setStrategyAlertHistory([]);
         setIsLandingPageActive(false);
         setRefundToast({
           show: true,
@@ -292,10 +433,6 @@ export default function App() {
         if (data.quotes) {
           setQuotes(data.quotes);
           setLastRefreshTime(new Date());
-          const activeQ = data.quotes[primaryInstrumentId] || data.quotes.XAUUSD;
-          if (activeQ) {
-            setTradePlans(generateTradePlans(activeQ));
-          }
         }
         if (data.primaryProvider) {
           const isYahoo = data.primaryProvider === 'yahoo_finance';
@@ -390,10 +527,16 @@ export default function App() {
   const activeQuote = quotes[primaryInstrumentId] || goldQuote;
   const dataQuality = getDataQualityStatus(goldQuote.timestamp);
 
+  // Recompute multi-horizon directional plans whenever live quote, chart candles, or indicators update
+  useEffect(() => {
+    if (!activeQuote) return;
+    setTradePlans(generateTradePlans(activeQuote, { candles, indicators, quote: activeQuote }));
+  }, [activeQuote, candles, indicators]);
+
   // Automated 100% Performance Guarantee Evaluator
   useEffect(() => {
     if (!activeQuote?.mid) return;
-    const result = evaluatePerformanceRefunds(entitlements, activeQuote.mid);
+    const result = evaluatePerformanceRefunds(entitlements, activeQuote.mid, userSession.uid);
     if (result.refundedCount > 0) {
       setEntitlements(result.updatedState);
       setRefundToast({
@@ -402,17 +545,567 @@ export default function App() {
       });
       setTimeout(() => setRefundToast((p) => ({ ...p, show: false })), 6000);
     }
-  }, [activeQuote?.mid, entitlements]);
+  }, [activeQuote?.mid, entitlements, userSession.uid]);
+
+  // Strategy Alert Subscriptions & Feed History: per-user localStorage + server sync
+  useEffect(() => {
+    const storageKey = `aurum_strategy_alert_subs_v1:${userSession.uid || 'guest'}`;
+    const historyStorageKey = `aurum_strategy_alert_history_v1:${userSession.uid || 'guest'}`;
+    firedStrategyAlertKeysRef.current.clear();
+
+    try {
+      const rawHistory = window.localStorage?.getItem(historyStorageKey);
+      const parsedHistory = rawHistory ? JSON.parse(rawHistory) : [];
+      setStrategyAlertHistory(Array.isArray(parsedHistory) ? parsedHistory.slice(0, 25) : []);
+    } catch {
+      setStrategyAlertHistory([]);
+    }
+
+    // Reset transient cross-workspace pointers & hydrate per-user trade alerts + canonical portfolio positions
+    setTradeAlerts(loadUserTradeAlerts(userSession.uid));
+    setUserPortfolioPositions([]);
+
+    const portfolioBackupKey = `goldvista_paper_journal_backup_v1:${userSession.uid || 'usr_guest_0000'}`;
+    try {
+      const rawPos = window.localStorage?.getItem(portfolioBackupKey);
+      const parsedPos = rawPos ? JSON.parse(rawPos) : [];
+      if (Array.isArray(parsedPos) && parsedPos.length > 0) {
+        setUserPortfolioPositions(parsedPos);
+      }
+    } catch {
+      setUserPortfolioPositions([]);
+    }
+
+    let cancelledPortfolio = false;
+    if (userSession.role !== 'GUEST') {
+      void (async () => {
+        try {
+          let token = await ensureSignedBearerToken(userSession);
+          if (!token || cancelledPortfolio) return;
+          let res = await fetch('/api/portfolio/journal', {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          if (res.status === 401) {
+            token = await ensureSignedBearerToken(userSession, true);
+            if (!token || cancelledPortfolio) return;
+            res = await fetch('/api/portfolio/journal', {
+              headers: { Authorization: `Bearer ${token}` },
+            });
+          }
+          if (!res.ok || cancelledPortfolio) return;
+          const payload = (await res.json()) as { positions?: PaperPosition[] };
+          if (!cancelledPortfolio && Array.isArray(payload?.positions)) {
+            setUserPortfolioPositions(payload.positions);
+            try {
+              window.localStorage?.setItem(portfolioBackupKey, JSON.stringify(payload.positions));
+            } catch {
+              // ignore storage write error
+            }
+          }
+        } catch {
+          // ignore offline fallback
+        }
+      })();
+    }
+
+    let localSubs: Record<string, StrategyAlertSubscription> = {};
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        const raw = window.localStorage.getItem(storageKey);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            localSubs = parsed;
+          }
+        }
+      }
+    } catch {
+      localSubs = {};
+    }
+    setStrategySubscriptions(localSubs);
+
+    if (userSession.role !== 'PRO' && userSession.role !== 'ALPHA') {
+      return () => {
+        cancelledPortfolio = true;
+      };
+    }
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        let token = await ensureSignedBearerToken(userSession);
+        if (!token || cancelled) return;
+        let res = await fetch('/api/alerts/strategy-subscriptions', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (res.status === 401) {
+          token = await ensureSignedBearerToken(userSession, true);
+          if (!token || cancelled) return;
+          res = await fetch('/api/alerts/strategy-subscriptions', {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+        }
+        if (!res.ok || cancelled) return;
+        const payload = (await res.json()) as {
+          subscriptions?: Record<string, StrategyAlertSubscription>;
+        };
+        const serverSubs = payload?.subscriptions || {};
+        const merged = { ...localSubs, ...serverSubs };
+        if (!cancelled) {
+          setStrategySubscriptions(merged);
+          try {
+            window.localStorage?.setItem(storageKey, JSON.stringify(merged));
+          } catch {
+            // ignore storage write error
+          }
+          const hasLocalOnlyKeys = Object.keys(localSubs).some((k) => !serverSubs[k]);
+          if (hasLocalOnlyKeys) {
+            await fetch('/api/alerts/strategy-subscriptions', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${token}`,
+              },
+              body: JSON.stringify({ subscriptions: merged }),
+            });
+          }
+        }
+      } catch {
+        // Ignore transient sync failures; local subscriptions stay active
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      cancelledPortfolio = true;
+    };
+  }, [userSession.uid, userSession.role]);
+
+  // Evaluate all 10 quantitative strategy entry criteria continuously on live market updates
+  const strategyAlertEvalSnapshot = useMemo(() => {
+    const strategies = getQuantitativeStrategies(activeQuote.mid);
+    return evaluateAllSubscribedStrategyAlerts(strategies, strategySubscriptions, {
+      currentMid: activeQuote.mid,
+      instrumentId: primaryInstrumentId,
+      candles,
+      indicators,
+      quote: activeQuote,
+      spreadPips: activeQuote.spreadPips,
+      tipsRealYieldPct: quotes['US_TIPS10Y']?.mid,
+    });
+  }, [activeQuote, primaryInstrumentId, candles, indicators, quotes, strategySubscriptions]);
+
+  const dispatchStrategyAlertNotification = useCallback(
+    async (
+      evalResult: StrategyEntryEvaluation,
+      options?: { simulateEntryMatch?: boolean; manualTrigger?: boolean }
+    ) => {
+      let resolvedEval = evalResult;
+      let serverDispatched = false;
+
+      if (userSession.role === 'PRO' || userSession.role === 'ALPHA') {
+        try {
+          let token = await ensureSignedBearerToken(userSession);
+          if (token) {
+            let res = await fetch('/api/alerts/strategy-trigger', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${token}`,
+              },
+              body: JSON.stringify({
+                strategyId: evalResult.strategyId,
+                instrumentId: evalResult.instrumentId,
+                currentMid: evalResult.triggerPrice,
+                simulateEntryMatch: Boolean(options?.simulateEntryMatch),
+              }),
+            });
+            if (res.status === 401) {
+              token = await ensureSignedBearerToken(userSession, true);
+              if (token) {
+                res = await fetch('/api/alerts/strategy-trigger', {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${token}`,
+                  },
+                  body: JSON.stringify({
+                    strategyId: evalResult.strategyId,
+                    instrumentId: evalResult.instrumentId,
+                    currentMid: evalResult.triggerPrice,
+                    simulateEntryMatch: Boolean(options?.simulateEntryMatch),
+                  }),
+                });
+              }
+            }
+            if (res.ok) {
+              const payload = (await res.json()) as {
+                evaluation?: StrategyEntryEvaluation;
+                dispatched?: boolean;
+              };
+              if (payload?.evaluation) {
+                resolvedEval = payload.evaluation;
+              }
+              serverDispatched = Boolean(payload?.dispatched);
+            }
+          }
+        } catch {
+          // Continue with in-app/browser notification fallback
+        }
+      }
+
+      const directionLabel: 'BUY' | 'SELL' = resolvedEval.direction === 'SELL' ? 'SELL' : 'BUY';
+      const toastTitle = `${options?.manualTrigger ? 'Simulated ' : ''}Strategy Alert: ${resolvedEval.strategyName} (${directionLabel} ${resolvedEval.instrumentId})`;
+      const toastBody =
+        resolvedEval.summary ||
+        `${resolvedEval.instrumentId} triggered @ $${resolvedEval.triggerPrice.toFixed(2)} (SL $${resolvedEval.stopLossPrice.toFixed(2)}, TP1 $${resolvedEval.target1Price.toFixed(2)}).`;
+
+      let browserPushSent = false;
+      try {
+        if (
+          typeof window !== 'undefined' &&
+          'Notification' in window &&
+          window.Notification.permission === 'granted'
+        ) {
+          new window.Notification(toastTitle, {
+            body: toastBody,
+            tag: `aurum-strat-${resolvedEval.strategyId}-${resolvedEval.instrumentId}`,
+          });
+          browserPushSent = true;
+        }
+      } catch {
+        // Ignore browser notification restrictions inside sandboxed iframes
+      }
+
+      const historyEntry: StrategyAlertHistoryItem = {
+        id: `SHIST-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`,
+        strategyId: resolvedEval.strategyId,
+        strategyName: resolvedEval.strategyName,
+        instrumentId: resolvedEval.instrumentId,
+        direction: directionLabel,
+        triggerPrice: resolvedEval.triggerPrice,
+        stopLossPrice: resolvedEval.stopLossPrice,
+        target1Price: resolvedEval.target1Price,
+        summary: toastBody,
+        timestamp: resolvedEval.evaluatedAt || new Date().toISOString(),
+        deliverySummary: browserPushSent
+          ? serverDispatched
+            ? 'Browser Push + Server Notification Dispatcher'
+            : 'Browser Push Notification'
+          : serverDispatched
+          ? 'In-App Toast + Server Notification Dispatcher'
+          : 'In-App Toast Notice',
+      };
+
+      setStrategyAlertHistory((prev) => {
+        const next = [historyEntry, ...prev].slice(0, 25);
+        try {
+          window.localStorage?.setItem(
+            `aurum_strategy_alert_history_v1:${userSession.uid || 'guest'}`,
+            JSON.stringify(next)
+          );
+        } catch {
+          // ignore storage write issue
+        }
+        return next;
+      });
+      setStrategySubscriptions((prev) => {
+        const existing = prev[resolvedEval.strategyId];
+        if (!existing) return prev;
+        const updated = {
+          ...prev,
+          [resolvedEval.strategyId]: {
+            ...existing,
+            lastTriggeredAt: historyEntry.timestamp,
+            lastTriggeredDirection: directionLabel,
+            lastTriggerPrice: resolvedEval.triggerPrice,
+          },
+        };
+        try {
+          window.localStorage?.setItem(
+            `aurum_strategy_alert_subs_v1:${userSession.uid || 'guest'}`,
+            JSON.stringify(updated)
+          );
+        } catch {
+          // ignore storage write issue
+        }
+        return updated;
+      });
+
+      setStrategyPushToast({
+        show: true,
+        title: toastTitle,
+        message: toastBody,
+      });
+      if (strategyToastTimerRef.current) {
+        clearTimeout(strategyToastTimerRef.current);
+      }
+      strategyToastTimerRef.current = setTimeout(() => {
+        setStrategyPushToast((p) => ({ ...p, show: false }));
+      }, 6500);
+    },
+    [userSession]
+  );
+
+  // Automatic Background Monitor: Fires deduplicated push alerts when subscribed strategies meet live entry criteria
+  useEffect(() => {
+    const evalMap = strategyAlertEvalSnapshot.evaluations;
+    for (const evalRes of Object.values(evalMap)) {
+      const sub = strategySubscriptions[evalRes.strategyId];
+      const keyPrefix = `${evalRes.strategyId}:`;
+      const isLiveMatch =
+        Boolean(sub?.enabled) &&
+        evalRes.criteriaMet &&
+        (evalRes.direction === 'BUY' || evalRes.direction === 'SELL');
+
+      if (isLiveMatch) {
+        const dedupeKey = `${evalRes.strategyId}:${evalRes.instrumentId}:${evalRes.direction}`;
+        if (!firedStrategyAlertKeysRef.current.has(dedupeKey)) {
+          firedStrategyAlertKeysRef.current.add(dedupeKey);
+          void dispatchStrategyAlertNotification(evalRes);
+        }
+      } else {
+        for (const existingKey of Array.from(firedStrategyAlertKeysRef.current)) {
+          if (existingKey.startsWith(keyPrefix)) {
+            firedStrategyAlertKeysRef.current.delete(existingKey);
+          }
+        }
+      }
+    }
+  }, [strategyAlertEvalSnapshot, strategySubscriptions, dispatchStrategyAlertNotification]);
+
+  const handleToggleStrategySubscription = useCallback(
+    (strategyId: string, enabled: boolean) => {
+      if (!enabled) {
+        const prefix = `${strategyId}:`;
+        for (const existingKey of Array.from(firedStrategyAlertKeysRef.current)) {
+          if (existingKey.startsWith(prefix)) {
+            firedStrategyAlertKeysRef.current.delete(existingKey);
+          }
+        }
+      }
+
+      setStrategySubscriptions((prev) => {
+        const existing = prev[strategyId];
+        const next: Record<string, StrategyAlertSubscription> = {
+          ...prev,
+          [strategyId]: {
+            strategyId,
+            enabled,
+            subscribedAt: existing?.subscribedAt || new Date().toISOString(),
+            lastTriggeredAt: existing?.lastTriggeredAt,
+            lastTriggeredDirection: existing?.lastTriggeredDirection,
+            lastTriggerPrice: existing?.lastTriggerPrice,
+          },
+        };
+        try {
+          window.localStorage?.setItem(
+            `aurum_strategy_alert_subs_v1:${userSession.uid || 'guest'}`,
+            JSON.stringify(next)
+          );
+        } catch {
+          // ignore storage write issue
+        }
+        return next;
+      });
+
+      if (userSession.role === 'PRO' || userSession.role === 'ALPHA') {
+        void (async () => {
+          try {
+            let token = await ensureSignedBearerToken(userSession);
+            if (!token) return;
+            let res = await fetch('/api/alerts/strategy-subscriptions', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${token}`,
+              },
+              body: JSON.stringify({ strategyId, enabled }),
+            });
+            if (res.status === 401) {
+              token = await ensureSignedBearerToken(userSession, true);
+              if (!token) return;
+              await fetch('/api/alerts/strategy-subscriptions', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${token}`,
+                },
+                body: JSON.stringify({ strategyId, enabled }),
+              });
+            }
+          } catch {
+            // Keep local subscription state intact on transient network failure
+          }
+        })();
+      }
+    },
+    [userSession]
+  );
+
+  const handleTestStrategyTrigger = useCallback(
+    async (strategyId: string) => {
+      const strategies = getQuantitativeStrategies(activeQuote.mid);
+      const strategy = strategies.find((s) => s.id === strategyId);
+      if (!strategy) return;
+      const currentEval = strategyAlertEvalSnapshot.evaluations[strategyId] || {
+        strategyId: strategy.id,
+        strategyName: strategy.name,
+        instrumentId: primaryInstrumentId,
+        criteriaMet: true,
+        direction: strategy.currentSignal.action === 'SELL' ? 'SELL' : 'BUY',
+        triggerPrice: activeQuote.mid,
+        stopLossPrice: Number((activeQuote.mid * 0.992).toFixed(2)),
+        target1Price: Number((activeQuote.mid * 1.016).toFixed(2)),
+        matchedConditionsCount: 2,
+        totalConditionsCount: 2,
+        checks: [],
+        summary: `${strategy.name} simulated entry alert triggered on ${primaryInstrumentId} @ $${activeQuote.mid.toFixed(2)}.`,
+        evaluatedAt: new Date().toISOString(),
+      };
+      await dispatchStrategyAlertNotification(currentEval, {
+        simulateEntryMatch: true,
+        manualTrigger: true,
+      });
+    },
+    [activeQuote.mid, primaryInstrumentId, strategyAlertEvalSnapshot, dispatchStrategyAlertNotification]
+  );
+
+  const strategyAlertFeed = useMemo(
+    () =>
+      buildChronologicalStrategyAlertFeed({
+        liveHistory: strategyAlertHistory,
+        strategies: getQuantitativeStrategies(activeQuote.mid),
+        evaluations: strategyAlertEvalSnapshot.evaluations,
+        quotes,
+        candles,
+        activeInstrumentId: primaryInstrumentId,
+        portfolioPositions: userPortfolioPositions,
+      }),
+    [
+      strategyAlertHistory,
+      activeQuote.mid,
+      strategyAlertEvalSnapshot.evaluations,
+      quotes,
+      candles,
+      primaryInstrumentId,
+      userPortfolioPositions,
+    ]
+  );
+
+  const handleClearStrategyAlertHistory = useCallback(() => {
+    setStrategyAlertHistory([]);
+    try {
+      window.localStorage?.removeItem(
+        `aurum_strategy_alert_history_v1:${userSession.uid || 'guest'}`
+      );
+    } catch {
+      // ignore storage cleanup issue
+    }
+  }, [userSession.uid]);
+
+  const handleJumpToChartSetup = useCallback((entry: StrategyAlertFeedEntry) => {
+    const plan = createTradePlanFromFeedEntry(entry);
+    setCurrentCommodity(entry.commodity);
+    setCurrentTimeframe(entry.timeframe);
+    setHistoricalPeriod(
+      entry.timeframe === '15m'
+        ? '5D'
+        : entry.timeframe === '1h'
+        ? '1M'
+        : entry.timeframe === '4h'
+        ? '1Y'
+        : '5Y'
+    );
+    setCustomHorizon(null);
+    setSelectedStrategyForBacktest(entry.strategyId);
+    setChartSetupJump({ entry, plan });
+    setActiveWorkspace('terminal');
+  }, []);
+
+  const handleJumpToPortfolioEntry = useCallback((entry: StrategyAlertFeedEntry) => {
+    if (entry.linkedPortfolioPositionId) {
+      setRequestedPortfolioTab('journal');
+      setRequestedPortfolioPositionId(entry.linkedPortfolioPositionId);
+      setActiveWorkspace('portfolio');
+      return;
+    }
+    if (entry.linkedAuditedPlanId) {
+      setRequestedPortfolioTab('historicalPlans');
+      setActiveWorkspace('portfolio');
+      return;
+    }
+    const plan = createTradePlanFromFeedEntry(entry);
+    setSelectedPlanForPaper(plan);
+    setRequestedPortfolioTab('journal');
+    setActiveWorkspace('portfolio');
+  }, []);
+
+  const handleOpenFullAlertFeed = useCallback(() => {
+    setActiveWorkspace('overview');
+    window.setTimeout(() => {
+      document
+        .getElementById('strategy-alert-feed-widget')
+        ?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 80);
+  }, []);
 
   const handleSelectForCFD = (plan: TradePlan) => {
     setSelectedPlanForCFD(plan);
     setActiveWorkspace('cfd');
   };
 
-  const handleExecutePaper = (plan: TradePlan) => {
+  const handleExecutePaper = (plan: TradePlan, suggestedLots?: number) => {
     setSelectedPlanForPaper(plan);
+    setSelectedPlanForPaperLots(
+      typeof suggestedLots === 'number' && Number.isFinite(suggestedLots) && suggestedLots > 0
+        ? suggestedLots
+        : null
+    );
+    setRequestedPortfolioTab('journal');
     setActiveWorkspace('portfolio');
   };
+
+  const handleTradeAlertDispatched = useCallback(
+    (alert: TradeLifecycleAlertEvent, allAlerts: TradeLifecycleAlertEvent[]) => {
+      setTradeAlerts(allAlerts);
+      const { title, summary } = formatTradeAlertHeadline(alert);
+      setTradeAlertToast({
+        show: true,
+        title,
+        message: summary,
+        positionId: alert.positionId,
+        eventType: alert.eventType,
+      });
+      if (tradeToastTimerRef.current) {
+        clearTimeout(tradeToastTimerRef.current);
+      }
+      tradeToastTimerRef.current = setTimeout(() => {
+        setTradeAlertToast((prev) => ({ ...prev, show: false }));
+      }, 6000);
+    },
+    []
+  );
+
+  const handleJumpToPositions = useCallback((positionId?: string) => {
+    setRequestedPortfolioTab('journal');
+    if (positionId) {
+      setRequestedPortfolioPositionId(positionId);
+    }
+    setActiveWorkspace('portfolio');
+  }, []);
+
+  const handleEnablePushNotifications = useCallback(async () => {
+    const result = await requestBrowserPushPermission();
+    setBrowserPushPermission(result);
+    if (result === 'granted') {
+      setRefundToast({
+        show: true,
+        message: 'Desktop push alerts enabled for trade open, close, and strategy triggers.',
+      });
+      setTimeout(() => setRefundToast((p) => ({ ...p, show: false })), 4000);
+    }
+  }, []);
 
   const handleUnlockPlan = (plan: TradePlan) => {
     if (entitlements.tier === 'PRO' || entitlements.tier === 'ALPHA') {
@@ -434,7 +1127,8 @@ export default function App() {
       plan.id,
       plan.stopLossPrice,
       plan.target1Price,
-      plan.direction as 'BUY' | 'SELL'
+      plan.direction as 'BUY' | 'SELL',
+      userSession.uid
     );
     if (res.success) {
       setEntitlements(res.updatedState);
@@ -448,7 +1142,7 @@ export default function App() {
 
   const handleCheckoutSuccess = (itemType: 'PACK' | 'TIER', itemId: string) => {
     if (itemType === 'PACK') {
-      const updated = purchaseCreditPack(entitlements, itemId);
+      const updated = purchaseCreditPack(entitlements, itemId, userSession.uid);
       setEntitlements(updated);
       setRefundToast({
         show: true,
@@ -456,7 +1150,7 @@ export default function App() {
       });
     } else {
       const newRole = itemId as UserRole;
-      const updated = upgradeMembershipTier(entitlements, itemId as any);
+      const updated = upgradeMembershipTier(entitlements, itemId as any, userSession.uid);
       setEntitlements(updated);
       // Synchronize active user session role
       const updatedSession: UserSession = {
@@ -474,22 +1168,55 @@ export default function App() {
     setTimeout(() => setRefundToast((p) => ({ ...p, show: false })), 5000);
   };
 
+  const handleChangeUserTier = (role: Exclude<UserRole, 'GUEST'>) => {
+    const updated = updateCurrentUserTier(role);
+    setUserSession(updated);
+    const scoped = loadUserEntitlements(updated.uid);
+    const nextEnt: UserEntitlementState = {
+      ...scoped,
+      tier: role,
+      creditsBalance:
+        role === 'ALPHA'
+          ? Math.max(scoped.creditsBalance, 500)
+          : role === 'PRO'
+          ? Math.max(scoped.creditsBalance, 100)
+          : scoped.creditsBalance,
+    };
+    saveUserEntitlements(nextEnt, updated.uid);
+    setEntitlements(nextEnt);
+    setRefundToast({
+      show: true,
+      message: `Account tier updated to ${role} for ${updated.displayName}. Your trades & ledger remain intact.`,
+    });
+    setTimeout(() => setRefundToast((p) => ({ ...p, show: false })), 4000);
+  };
+
   const handleSwitchPersona = (role: UserRole) => {
     const updated = switchPersona(role);
     setUserSession(updated);
-    setEntitlements((prev) => ({
-      ...prev,
+    setSelectedPlanForPaper(null);
+    setSelectedPlanForPaperLots(null);
+    setSelectedPlanForCFD(null);
+    setChartSetupJump(null);
+    setRequestedPortfolioPositionId(null);
+    setStrategyPushToast({ show: false, title: '', message: '' });
+    setTradeAlertToast({ show: false, title: '', message: '' });
+    const scoped = loadUserEntitlements(updated.uid);
+    const nextEnt: UserEntitlementState = {
+      ...scoped,
       tier: role === 'ALPHA' ? 'ALPHA' : role === 'PRO' ? 'PRO' : 'FREE',
       creditsBalance:
         role === 'ALPHA'
-          ? Math.max(prev.creditsBalance, 500)
+          ? Math.max(scoped.creditsBalance, 500)
           : role === 'PRO'
-          ? Math.max(prev.creditsBalance, 100)
-          : prev.creditsBalance,
-    }));
+          ? Math.max(scoped.creditsBalance, 100)
+          : scoped.creditsBalance,
+    };
+    saveUserEntitlements(nextEnt, updated.uid);
+    setEntitlements(nextEnt);
     setRefundToast({
       show: true,
-      message: `Active persona switched to ${role} (${DEMO_PERSONAS[role].displayName}). Tier permissions active.`,
+      message: `Switched demo account to ${DEMO_PERSONAS[role].displayName} (${role} tier).`,
     });
     setTimeout(() => setRefundToast((p) => ({ ...p, show: false })), 4000);
   };
@@ -497,10 +1224,20 @@ export default function App() {
   const handleLogout = () => {
     const guest = logoutUser();
     setUserSession(guest);
-    setEntitlements((prev) => ({
-      ...prev,
+    setSelectedPlanForPaper(null);
+    setSelectedPlanForPaperLots(null);
+    setSelectedPlanForCFD(null);
+    setChartSetupJump(null);
+    setRequestedPortfolioPositionId(null);
+    setStrategyPushToast({ show: false, title: '', message: '' });
+    setTradeAlertToast({ show: false, title: '', message: '' });
+    const guestEnt = loadUserEntitlements(guest.uid);
+    const nextEnt: UserEntitlementState = {
+      ...guestEnt,
       tier: 'FREE',
-    }));
+    };
+    saveUserEntitlements(nextEnt, guest.uid);
+    setEntitlements(nextEnt);
     setRefundToast({
       show: true,
       message: 'Signed out. Platform reverted to Public / Guest mode.',
@@ -510,11 +1247,19 @@ export default function App() {
 
   const handleSessionUpdated = (session: UserSession, isNewEnrollment?: boolean) => {
     setUserSession(session);
-    setEntitlements((prev) => ({
-      ...prev,
+    setSelectedPlanForPaper(null);
+    setSelectedPlanForPaperLots(null);
+    setSelectedPlanForCFD(null);
+    setChartSetupJump(null);
+    setRequestedPortfolioPositionId(null);
+    const scoped = loadUserEntitlements(session.uid);
+    const nextEnt: UserEntitlementState = {
+      ...scoped,
       tier: session.role === 'ALPHA' ? 'ALPHA' : session.role === 'PRO' ? 'PRO' : 'FREE',
-      creditsBalance: isNewEnrollment ? prev.creditsBalance + 5 : prev.creditsBalance,
-    }));
+      creditsBalance: isNewEnrollment ? Math.max(scoped.creditsBalance, 5) : scoped.creditsBalance,
+    };
+    saveUserEntitlements(nextEnt, session.uid);
+    setEntitlements(nextEnt);
     if (isNewEnrollment) {
       setRefundToast({
         show: true,
@@ -538,6 +1283,7 @@ export default function App() {
   const handleDirectEnroll = async (data: {
     email: string;
     displayName: string;
+    password?: string;
     country: string;
     tradingProfile: {
       primaryHorizon: 'INTRADAY' | 'SWING' | 'PROP_FIRM' | 'MACRO';
@@ -546,18 +1292,16 @@ export default function App() {
       experienceLevel: 'NOVICE' | 'INTERMEDIATE' | 'ADVANCED' | 'INSTITUTIONAL';
     };
   }) => {
-    try {
-      const session = await enrollNewCustomer({
-        email: data.email,
-        displayName: data.displayName,
-        authProvider: 'email',
-        tradingProfile: data.tradingProfile,
-      });
-      handleSessionUpdated(session, true);
-      handleLaunchTerminal();
-    } catch (e) {
-      console.error(e);
-    }
+    const session = await enrollNewCustomer({
+      email: data.email,
+      displayName: data.displayName,
+      password: data.password,
+      rejectDuplicate: Boolean(data.password),
+      authProvider: 'email',
+      tradingProfile: data.tradingProfile,
+    });
+    handleSessionUpdated(session, true);
+    handleLaunchTerminal();
   };
 
   const getWorkspaceTitle = (): string => {
@@ -592,6 +1336,8 @@ export default function App() {
         return 'Walk-Forward Backtesting Engine';
       case 'portfolio':
         return 'Paper Trading Portfolio & Journal';
+      case 'performance_insights':
+        return 'Performance Insights & Trade Analytics';
       case 'council':
         return 'AI Advisory Council & Specialist Agents';
       case 'reports':
@@ -617,7 +1363,7 @@ export default function App() {
     <div
       className={`${
         isFitToScreen ? 'h-screen max-h-screen overflow-hidden' : 'min-h-screen'
-      } flex flex-col ${
+      } flex flex-col overflow-x-hidden ${
         isDark ? 'dark bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-900'
       }`}
     >
@@ -628,45 +1374,66 @@ export default function App() {
         Skip to main workspace
       </a>
       {/* Top Bar Contract */}
-      <Navbar
-        quotes={quotes}
-        isDark={isDark}
-        onToggleTheme={() => setIsDark(!isDark)}
-        activeWorkspaceTitle={getWorkspaceTitle()}
-        currentCommodity={currentCommodity}
-        onCommodityChange={setCurrentCommodity}
-        isRefreshing={isRefreshingQuotes}
-        onRefreshQuotes={fetchQuotesFromServer}
-        lastRefreshTime={lastRefreshTime}
-        isFitToScreen={isFitToScreen}
-        onToggleFitToScreen={() => setIsFitToScreen((prev) => !prev)}
-        isSidebarCollapsed={isSidebarCollapsed}
-        onToggleSidebar={() => setIsSidebarCollapsed((prev) => !prev)}
-        onOpenMobileMenu={() => setIsMobileMenuOpen(true)}
-        creditsBalance={entitlements.creditsBalance}
-        membershipTier={entitlements.tier}
-        onOpenPricingHub={() => setActiveWorkspace('monetization')}
-        userSession={userSession}
-        onOpenAuth={(mode) => {
-          setAuthModalMode(mode || 'LOGIN');
-          setIsAuthModalOpen(true);
-        }}
-        onSwitchPersona={handleSwitchPersona}
-        onLogout={handleLogout}
-        isLandingPageActive={isLandingPageActive}
-        onToggleLandingPage={() => setIsLandingPageActive(!isLandingPageActive)}
-        feedStatus={feedStatus}
-      />
+      {(() => {
+        const openPositionsList = userPortfolioPositions.filter((p) => p.status === 'OPEN');
+        const openUnrealized = openPositionsList.reduce((acc, p) => {
+          const mark = quotes[p.instrumentId]?.mid || activeQuote.mid || p.currentPrice;
+          const delta = p.direction === 'SELL' ? p.entryPrice - mark : mark - p.entryPrice;
+          return acc + delta * p.lots * getInstrumentMultiplierForMae(p.instrumentId);
+        }, 0);
+        return (
+          <Navbar
+            quotes={quotes}
+            isDark={isDark}
+            onToggleTheme={() => setIsDark(!isDark)}
+            activeWorkspaceTitle={getWorkspaceTitle()}
+            currentCommodity={currentCommodity}
+            onCommodityChange={setCurrentCommodity}
+            isRefreshing={isRefreshingQuotes}
+            onRefreshQuotes={fetchQuotesFromServer}
+            lastRefreshTime={lastRefreshTime}
+            isFitToScreen={isFitToScreen}
+            onToggleFitToScreen={() => setIsFitToScreen((prev) => !prev)}
+            isSidebarCollapsed={isSidebarCollapsed}
+            onToggleSidebar={() => setIsSidebarCollapsed((prev) => !prev)}
+            onOpenMobileMenu={() => setIsMobileMenuOpen(true)}
+            creditsBalance={entitlements.creditsBalance}
+            membershipTier={entitlements.tier}
+            onOpenPricingHub={() => setActiveWorkspace('monetization')}
+            userSession={userSession}
+            onOpenAuth={(mode) => {
+              setAuthModalMode(mode || 'LOGIN');
+              setIsAuthModalOpen(true);
+            }}
+            onSwitchPersona={handleSwitchPersona}
+            onChangeTier={handleChangeUserTier}
+            onLogout={handleLogout}
+            isLandingPageActive={isLandingPageActive}
+            onToggleLandingPage={() => setIsLandingPageActive(!isLandingPageActive)}
+            onOpenCommandPalette={() => setIsCommandPaletteOpen(true)}
+            openPositionsCount={openPositionsList.length}
+            openUnrealizedPnl={openUnrealized}
+            onJumpToPositions={handleJumpToPositions}
+            tradeAlerts={tradeAlerts}
+            onMarkAlertsRead={() => setTradeAlerts(markAllTradeAlertsRead(userSession.uid))}
+            browserPushPermission={browserPushPermission}
+            onEnablePushNotifications={handleEnablePushNotifications}
+            feedStatus={feedStatus}
+          />
+        );
+      })()}
 
       {isLandingPageActive ? (
         <div className="flex-1 overflow-y-auto">
           <LandingPage
             quotes={quotes}
+            userSession={userSession}
             onLaunchTerminal={handleLaunchTerminal}
             onOpenAuth={(mode) => {
               setAuthModalMode(mode || 'ENROLL');
               setIsAuthModalOpen(true);
             }}
+            onLogout={handleLogout}
             onOpenCheckout={(item) => {
               setCheckoutItem(item);
               setIsCheckoutOpen(true);
@@ -689,6 +1456,18 @@ export default function App() {
             isOpenMobile={isMobileMenuOpen}
             onCloseMobile={() => setIsMobileMenuOpen(false)}
             userRole={userSession.role}
+            userSession={userSession}
+            onOpenAuth={(mode) => {
+              setAuthModalMode(mode || 'LOGIN');
+              setIsAuthModalOpen(true);
+            }}
+            onLogout={handleLogout}
+            onOpenCommandPalette={() => setIsCommandPaletteOpen(true)}
+            strategyAlertFeed={strategyAlertFeed}
+            onJumpToChartSetup={handleJumpToChartSetup}
+            onJumpToPortfolioEntry={handleJumpToPortfolioEntry}
+            onOpenFullAlertFeed={handleOpenFullAlertFeed}
+            openPositionsCount={userPortfolioPositions.filter((p) => p.status === 'OPEN').length}
           />
 
           {/* Content Viewport */}
@@ -697,8 +1476,13 @@ export default function App() {
             tabIndex={-1}
             className={`flex-1 focus:outline-none ${
               isFitToScreen ? 'overflow-y-auto' : 'overflow-y-visible'
-            } p-3 sm:p-5 lg:p-6 pb-20 md:pb-6 max-w-[1680px] w-full mx-auto`}
+            } p-3 sm:p-5 lg:p-6 pb-24 md:pb-6 max-w-[1680px] w-full mx-auto`}
           >
+            <WorkspaceErrorBoundary
+              workspaceTitle={getWorkspaceTitle()}
+              resetKey={activeWorkspace}
+              onReturnToOverview={() => setActiveWorkspace('overview')}
+            >
             {!accessCheck.allowed ? (
               <AccessGateGuard
                 accessCheck={accessCheck}
@@ -713,6 +1497,7 @@ export default function App() {
                   setIsCheckoutOpen(true);
                 }}
                 onSwitchPersona={handleSwitchPersona}
+                onChangeTier={handleChangeUserTier}
               />
             ) : (
               <>
@@ -821,28 +1606,33 @@ export default function App() {
                     <span className="text-xs font-mono text-amber-400 uppercase tracking-widest block font-bold">
                       EXECUTIVE ADVISORY PULSE
                     </span>
-                    <h1 className="text-lg sm:text-2xl font-bold text-slate-100 mt-1">
-                      {primaryInstrument.displayName} · Live Market Rate: ${primaryInstrumentId.includes('10Y') ? goldQuote.mid.toFixed(3) : goldQuote.mid.toFixed(2)}
+                    <h1 className="text-lg sm:text-2xl font-bold text-slate-100 mt-1 tabular-nums">
+                      {primaryInstrument.displayName} · Live Market Rate: ${primaryInstrumentId.includes('10Y') ? activeQuote.mid.toFixed(3) : activeQuote.mid.toFixed(2)}
                     </h1>
                   </div>
 
-                  <div className="flex items-center gap-2 sm:gap-3">
-                    <span className="flex items-center gap-1.5 px-2.5 py-1 bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 rounded text-xs font-mono font-bold">
-                      <ArrowUpRight className="w-3.5 h-3.5" />
-                      Live Feed: {goldQuote.provider}
+                  <div className="flex flex-wrap items-center gap-3 text-xs font-mono">
+                    <span className="flex items-center gap-1 text-emerald-400 font-semibold">
+                      <ArrowUpRight className="w-3.5 h-3.5" aria-hidden="true" />
+                      Feed: {activeQuote.provider}
                     </span>
-                    <span
-                      aria-live="polite"
-                      className="text-xs font-mono px-2.5 py-1 bg-slate-950 border border-slate-800 text-slate-300 rounded"
-                    >
+                    <span className="text-slate-600" aria-hidden="true">·</span>
+                    <span aria-live="polite" className="text-slate-300">
                       Freshness: {dataQuality.label}
                     </span>
+                    <button
+                      type="button"
+                      onClick={() => setRationaleModalHorizon(overviewRationaleHorizon)}
+                      className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-700 rounded text-xs font-sans font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      Inspect Strategy Bias Rationale
+                    </button>
                   </div>
                 </div>
 
                 {/* Macro Synthesis Callout */}
                 <p className="text-xs sm:text-sm text-slate-300 mt-3 leading-relaxed max-w-4xl">
-                  {primaryInstrument.displayName} trades at <strong>${goldQuote.mid.toFixed(2)}</strong> (+{goldQuote.change24hPct}% 24h change), verified against official continuous COMEX/ICE benchmark quotes. The secular macroeconomic trend remains strongly supported by physical central bank reserve diversification and lower Treasury real yields.
+                  {primaryInstrument.displayName} trades at <strong className="tabular-nums">${activeQuote.mid.toFixed(2)}</strong> ({activeQuote.change24hPct >= 0 ? '+' : ''}{activeQuote.change24hPct}% 24h change), verified against official continuous COMEX/ICE benchmark quotes. Directional recommendations adapt per horizon based on live EMA structure, candle slope, oscillators, and commodity causal news catalysts.
                 </p>
               </div>
 
@@ -908,6 +1698,7 @@ export default function App() {
                   </div>
                   <CandleChart
                     candles={candles}
+                    instrumentId={primaryInstrument.id}
                     timeframe={currentTimeframe}
                     period={historicalPeriod}
                     onTimeframeChange={setCurrentTimeframe}
@@ -922,6 +1713,8 @@ export default function App() {
                     height={isFitToScreen ? 500 : 460}
                     isFitToScreen={isFitToScreen}
                     onToggleFitScreen={() => setIsFitToScreen((prev) => !prev)}
+                    smartAnnotationsEnabled={smartAnnotationsEnabled}
+                    onToggleSmartAnnotations={handleToggleGlobalSmartAnnotations}
                   />
                 </div>
 
@@ -937,8 +1730,12 @@ export default function App() {
                     {tradePlans['SWING'] && (
                       <TradePlanCard
                         plan={tradePlans['SWING']}
+                        quote={activeQuote}
+                        candles={candles}
+                        indicators={indicators}
                         onSelectForCFD={handleSelectForCFD}
                         onExecutePaper={handleExecutePaper}
+                        onInspectRationale={(p) => setRationaleModalHorizon(p.horizon)}
                         isLocked={!isPlanUnlocked(entitlements, tradePlans['SWING'].id)}
                         onUnlock={handleUnlockPlan}
                         isGuaranteed={Boolean(entitlements.unlockedPlans[tradePlans['SWING'].id]?.status === 'ACTIVE' && !entitlements.unlockedPlans[tradePlans['SWING'].id]?.refunded)}
@@ -948,15 +1745,39 @@ export default function App() {
                 )}
               </div>
 
+              {/* Real-Time Trade Volume Profile & Institutional Liquidity Zones */}
+              <TradeVolumeProfileWidget
+                candles={candles}
+                quote={activeQuote}
+                instrumentName={primaryInstrument.displayName}
+                instrumentId={primaryInstrumentId}
+                timeframe={currentTimeframe}
+              />
+
               {/* Multi-Horizon Advisory Snapshot Strip */}
               <div>
-                <h3 className="text-xs font-mono uppercase tracking-wider text-slate-400 mb-3">
-                  Multi-Horizon Advisory Recommendations
-                </h3>
+                <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                  <h3 className="text-xs font-mono uppercase tracking-wider text-slate-400">
+                    Multi-Horizon Advisory Recommendations
+                  </h3>
+                  <button
+                    type="button"
+                    onClick={() => setRationaleModalHorizon(overviewRationaleHorizon)}
+                    className="text-xs font-mono text-amber-400 hover:underline whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    Open Detailed Rationale Modal →
+                  </button>
+                </div>
                 <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
-                  {['INTRADAY', 'SHORT_TERM', 'SWING', 'LONG_TERM'].map((horizon) => {
+                  {(['INTRADAY', 'SHORT_TERM', 'SWING', 'LONG_TERM'] as AdvisoryHorizon[]).map((horizon) => {
                     const plan = tradePlans[horizon];
                     if (!plan) return null;
+                    const dirColor =
+                      plan.direction === 'BUY'
+                        ? 'text-emerald-400 bg-emerald-500/10'
+                        : plan.direction === 'SELL'
+                        ? 'text-rose-400 bg-rose-500/10'
+                        : 'text-amber-300 bg-amber-500/10';
                     return (
                       <div
                         key={horizon}
@@ -964,33 +1785,65 @@ export default function App() {
                       >
                         <div className="flex justify-between items-center pb-2 border-b border-slate-800">
                           <span className="font-bold text-slate-300">{horizon}</span>
-                          <span className="text-emerald-400 font-bold bg-emerald-500/10 px-2 py-0.5 rounded">
+                          <span className={`font-bold px-2 py-0.5 rounded ${dirColor}`}>
                             {plan.direction}
                           </span>
                         </div>
-                        <div className="flex justify-between text-slate-400">
+                        <div className="flex justify-between text-slate-400 tabular-nums">
                           <span>Entry Zone:</span>
                           <span className="text-slate-200 font-bold">
                             ${plan.entryZoneMin} - ${plan.entryZoneMax}
                           </span>
                         </div>
-                        <div className="flex justify-between text-slate-400">
+                        <div className="flex justify-between text-slate-400 tabular-nums">
                           <span>Stop Loss:</span>
                           <span className="text-rose-400 font-bold">${plan.stopLossPrice}</span>
                         </div>
-                        <div className="flex justify-between text-slate-400">
+                        <div className="flex justify-between text-slate-400 tabular-nums">
                           <span>Target 1:</span>
                           <span className="text-emerald-400 font-bold">${plan.target1Price}</span>
                         </div>
-                        <div className="flex justify-between text-slate-400 pt-1 border-t border-slate-800/60">
-                          <span>Net R:R:</span>
-                          <span className="text-amber-400 font-bold">1:{plan.rewardToRiskRatio}</span>
+                        <div className="flex justify-between items-center text-slate-400 pt-1.5 border-t border-slate-800/60 tabular-nums">
+                          <span>Net R:R: <strong className="text-amber-400">1:{plan.rewardToRiskRatio}</strong></span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setOverviewRationaleHorizon(horizon);
+                              setRationaleModalHorizon(horizon);
+                            }}
+                            className="text-amber-400 hover:text-amber-300 font-sans font-medium hover:underline cursor-pointer"
+                          >
+                            Rationale →
+                          </button>
                         </div>
                       </div>
                     );
                   })}
                 </div>
               </div>
+
+              {/* Strategy Bias Rationale Panel */}
+              <StrategyBiasRationalePanel
+                quote={activeQuote}
+                candles={candles}
+                indicators={indicators}
+                tradePlans={tradePlans}
+                selectedHorizon={overviewRationaleHorizon}
+                onHorizonChange={setOverviewRationaleHorizon}
+              />
+
+              {/* Chronological Strategy Alert Feed Dashboard Widget */}
+              <StrategyAlertFeedWidget
+                entries={strategyAlertFeed}
+                onJumpToChartSetup={handleJumpToChartSetup}
+                onJumpToPortfolioEntry={handleJumpToPortfolioEntry}
+                onOpenStrategyLab={(strategyId) => {
+                  setSelectedStrategyForBacktest(strategyId);
+                  setActiveWorkspace('strategies');
+                }}
+                onClearLiveHistory={handleClearStrategyAlertHistory}
+                activeInstrumentId={primaryInstrumentId}
+              />
 
               {/* Cross-Commodity Spread Intelligence & Forecast Accountability Ledger */}
               <CrossCommoditySpreadsPanel quotes={quotes} />
@@ -1018,15 +1871,55 @@ export default function App() {
                 </div>
               </div>
 
+              {chartSetupJump && chartSetupJump.entry.instrumentId === primaryInstrumentId && (
+                <div
+                  role="status"
+                  className="bg-slate-900 border border-amber-500/40 rounded-lg px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs font-mono"
+                >
+                  <div className="min-w-0">
+                    <span className="text-amber-300 font-bold">
+                      Alert Chart Setup Active: {chartSetupJump.entry.strategyName}
+                    </span>
+                    <span className="text-slate-300 ml-2 tabular-nums">
+                      {chartSetupJump.entry.direction} {chartSetupJump.entry.instrumentId} ({chartSetupJump.entry.timeframe}) · Entry $
+                      {chartSetupJump.entry.triggerPrice.toFixed(2)} · SL $
+                      {chartSetupJump.entry.stopLossPrice.toFixed(2)} · TP1 $
+                      {chartSetupJump.entry.target1Price.toFixed(2)}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => handleJumpToPortfolioEntry(chartSetupJump.entry)}
+                      className="px-3 py-1 rounded bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 font-medium cursor-pointer"
+                    >
+                      {chartSetupJump.entry.linkedPortfolioPositionId ? 'View Portfolio Entry' : 'Open in Portfolio'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setChartSetupJump(null)}
+                      className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 cursor-pointer"
+                    >
+                      Reset Overlay
+                    </button>
+                  </div>
+                </div>
+              )}
+
               <CandleChart
                 candles={candles}
+                instrumentId={primaryInstrument.id}
                 timeframe={currentTimeframe}
                 period={historicalPeriod}
                 onTimeframeChange={setCurrentTimeframe}
                 onPeriodChange={handlePeriodChange}
                 customHorizon={customHorizon}
                 onCustomHorizonChange={setCustomHorizon}
-                tradePlan={tradePlans['INTRADAY']}
+                tradePlan={
+                  chartSetupJump && chartSetupJump.entry.instrumentId === primaryInstrumentId
+                    ? chartSetupJump.plan
+                    : tradePlans['INTRADAY']
+                }
                 indicators={indicators}
                 coverageReport={coverageReport}
                 unit={primaryInstrument.unit}
@@ -1034,6 +1927,8 @@ export default function App() {
                 height={isFitToScreen ? 560 : 520}
                 isFitToScreen={isFitToScreen}
                 onToggleFitScreen={() => setIsFitToScreen((prev) => !prev)}
+                smartAnnotationsEnabled={smartAnnotationsEnabled}
+                onToggleSmartAnnotations={handleToggleGlobalSmartAnnotations}
               />
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -1042,8 +1937,12 @@ export default function App() {
                   {tradePlans['INTRADAY'] && (
                     <TradePlanCard
                       plan={tradePlans['INTRADAY']}
+                      quote={activeQuote}
+                      candles={candles}
+                      indicators={indicators}
                       onSelectForCFD={handleSelectForCFD}
                       onExecutePaper={handleExecutePaper}
+                      onInspectRationale={(p) => setRationaleModalHorizon(p.horizon)}
                       isLocked={!isPlanUnlocked(entitlements, tradePlans['INTRADAY'].id)}
                       onUnlock={handleUnlockPlan}
                       isGuaranteed={Boolean(entitlements.unlockedPlans[tradePlans['INTRADAY'].id]?.status === 'ACTIVE' && !entitlements.unlockedPlans[tradePlans['INTRADAY'].id]?.refunded)}
@@ -1055,8 +1954,12 @@ export default function App() {
                   {tradePlans['CFD'] && (
                     <TradePlanCard
                       plan={tradePlans['CFD']}
+                      quote={activeQuote}
+                      candles={candles}
+                      indicators={indicators}
                       onSelectForCFD={handleSelectForCFD}
                       onExecutePaper={handleExecutePaper}
+                      onInspectRationale={(p) => setRationaleModalHorizon(p.horizon)}
                       isLocked={!isPlanUnlocked(entitlements, tradePlans['CFD'].id)}
                       onUnlock={handleUnlockPlan}
                       isGuaranteed={Boolean(entitlements.unlockedPlans[tradePlans['CFD'].id]?.status === 'ACTIVE' && !entitlements.unlockedPlans[tradePlans['CFD'].id]?.refunded)}
@@ -1120,6 +2023,7 @@ export default function App() {
               {/* Interactive Technical Chart with Indicator Overlays & Oscillators */}
               <CandleChart
                 candles={candles}
+                instrumentId={primaryInstrument.id}
                 timeframe={currentTimeframe}
                 period={historicalPeriod}
                 onTimeframeChange={setCurrentTimeframe}
@@ -1132,6 +2036,8 @@ export default function App() {
                 unit={primaryInstrument.unit}
                 instrumentName={primaryInstrument.displayName}
                 height={520}
+                smartAnnotationsEnabled={smartAnnotationsEnabled}
+                onToggleSmartAnnotations={handleToggleGlobalSmartAnnotations}
               />
 
               {/* Pivot Levels & Bollinger Bands Table */}
@@ -1206,8 +2112,12 @@ export default function App() {
               {tradePlans['INTRADAY'] && (
                 <TradePlanCard
                   plan={tradePlans['INTRADAY']}
+                  quote={activeQuote}
+                  candles={candles}
+                  indicators={indicators}
                   onSelectForCFD={handleSelectForCFD}
                   onExecutePaper={handleExecutePaper}
+                  onInspectRationale={(p) => setRationaleModalHorizon(p.horizon)}
                   isLocked={!isPlanUnlocked(entitlements, tradePlans['INTRADAY'].id)}
                   onUnlock={handleUnlockPlan}
                   isGuaranteed={Boolean(entitlements.unlockedPlans[tradePlans['INTRADAY'].id]?.status === 'ACTIVE' && !entitlements.unlockedPlans[tradePlans['INTRADAY'].id]?.refunded)}
@@ -1231,8 +2141,12 @@ export default function App() {
               {tradePlans['SWING'] && (
                 <TradePlanCard
                   plan={tradePlans['SWING']}
+                  quote={activeQuote}
+                  candles={candles}
+                  indicators={indicators}
                   onSelectForCFD={handleSelectForCFD}
                   onExecutePaper={handleExecutePaper}
+                  onInspectRationale={(p) => setRationaleModalHorizon(p.horizon)}
                   isLocked={!isPlanUnlocked(entitlements, tradePlans['SWING'].id)}
                   onUnlock={handleUnlockPlan}
                   isGuaranteed={Boolean(entitlements.unlockedPlans[tradePlans['SWING'].id]?.status === 'ACTIVE' && !entitlements.unlockedPlans[tradePlans['SWING'].id]?.refunded)}
@@ -1256,8 +2170,12 @@ export default function App() {
               {tradePlans['LONG_TERM'] && (
                 <TradePlanCard
                   plan={tradePlans['LONG_TERM']}
+                  quote={activeQuote}
+                  candles={candles}
+                  indicators={indicators}
                   onSelectForCFD={handleSelectForCFD}
                   onExecutePaper={handleExecutePaper}
+                  onInspectRationale={(p) => setRationaleModalHorizon(p.horizon)}
                   isLocked={!isPlanUnlocked(entitlements, tradePlans['LONG_TERM'].id)}
                   onUnlock={handleUnlockPlan}
                   isGuaranteed={Boolean(entitlements.unlockedPlans[tradePlans['LONG_TERM'].id]?.status === 'ACTIVE' && !entitlements.unlockedPlans[tradePlans['LONG_TERM'].id]?.refunded)}
@@ -1331,6 +2249,16 @@ export default function App() {
               onExecutePaper={handleExecutePaper}
               currentMid={activeQuote.mid}
               instrumentId={primaryInstrumentId}
+              candles={candles}
+              indicators={indicators}
+              quote={activeQuote}
+              tipsRealYieldPct={quotes['US_TIPS10Y']?.mid}
+              subscriptions={strategySubscriptions}
+              evaluations={strategyAlertEvalSnapshot.evaluations}
+              alertHistory={strategyAlertHistory}
+              onToggleSubscription={handleToggleStrategySubscription}
+              onTestStrategyTrigger={handleTestStrategyTrigger}
+              onClearAlertHistory={handleClearStrategyAlertHistory}
             />
           )}
 
@@ -1351,36 +2279,69 @@ export default function App() {
           {/* 12. WORKSPACE: PORTFOLIO & JOURNAL */}
           {activeWorkspace === 'portfolio' && (
             <PortfolioJournalWorkspace
+              key={userSession.uid}
               quote={goldQuote}
               quotes={quotes}
               tradePlans={tradePlans}
               newPaperPlan={selectedPlanForPaper}
+              newPaperPlanLots={selectedPlanForPaperLots}
+              onConsumePaperPlan={() => {
+                setSelectedPlanForPaper(null);
+                setSelectedPlanForPaperLots(null);
+              }}
+              requestedTab={requestedPortfolioTab}
+              onConsumeRequestedTab={() => setRequestedPortfolioTab(null)}
+              requestedPositionId={requestedPortfolioPositionId}
+              onConsumeRequestedPositionId={() => setRequestedPortfolioPositionId(null)}
+              onPositionsChanged={setUserPortfolioPositions}
+              onTradeAlertDispatched={handleTradeAlertDispatched}
+            />
+          )}
+
+          {/* 12B. WORKSPACE: PERFORMANCE INSIGHTS */}
+          {activeWorkspace === 'performance_insights' && (
+            <PerformanceInsightsWorkspace
+              key={userSession.uid}
+              quote={goldQuote}
+              quotes={quotes}
+              onNavigateToPortfolio={() => setActiveWorkspace('portfolio')}
             />
           )}
 
           {/* 13. WORKSPACE: AI ADVISORY COUNCIL */}
           {activeWorkspace === 'council' && (
             <CouncilWorkspace
-              agents={getSpecialistAgents(goldQuote.mid)}
-              evidence={getEvidenceRegistry(goldQuote.mid)}
+              agents={getSpecialistAgents(activeQuote.mid, { candles, indicators, quote: activeQuote })}
+              evidence={getEvidenceRegistry(activeQuote.mid, { candles, indicators, quote: activeQuote })}
+              quotes={quotes}
+              candles={candles}
+              currentCommodity={currentCommodity}
+              timeframe={currentTimeframe}
             />
           )}
 
           {/* 14. WORKSPACE: REPORTS & PUBLISHING */}
           {activeWorkspace === 'reports' && (
             <ReportsWorkspace
-              quote={goldQuote}
+              quote={activeQuote}
               regime={CURRENT_MARKET_REGIME}
               indicators={indicators}
               tradePlans={tradePlans}
               candles={candles}
               currentCommodity={currentCommodity}
+              timeframe={currentTimeframe}
             />
           )}
 
           {/* 15. WORKSPACE: ALERTS & DATA QUALITY */}
           {activeWorkspace === 'alerts' && (
-            <AlertsWorkspace quote={goldQuote} />
+            <AlertsWorkspace
+              quote={goldQuote}
+              quotes={quotes}
+              dailyCandles={primaryInstrumentId === 'XAUUSD' && currentTimeframe === '1D' ? candles : undefined}
+              chartCandles={currentCommodity === 'GOLD' ? candles : undefined}
+              chartTimeframe={currentCommodity === 'GOLD' ? currentTimeframe : '1D'}
+            />
           )}
 
           {/* 16. WORKSPACE: MARKET DATA & BROKERS (NEW PRODUCTION ENHANCEMENT) */}
@@ -1410,7 +2371,12 @@ export default function App() {
                 setIsCheckoutOpen(true);
               }}
               onLinkBroker={(brokerId, accountNo) => {
-                const updated = linkBrokerPartnerAccount(entitlements, brokerId, accountNo);
+                const updated = linkBrokerPartnerAccount(
+                  entitlements,
+                  brokerId,
+                  accountNo,
+                  userSession.uid
+                );
                 setEntitlements(updated);
                 setRefundToast({
                   show: true,
@@ -1422,17 +2388,100 @@ export default function App() {
           )}
               </>
             )}
+            </WorkspaceErrorBoundary>
           </main>
         </div>
       )}
 
       {/* Floating 100% Performance Guarantee Toast Notification */}
       {refundToast.show && (
-        <div className="fixed bottom-14 md:bottom-6 right-4 z-50 max-w-sm bg-slate-900 border border-emerald-500/50 text-emerald-400 p-3.5 rounded-lg shadow-2xl flex items-center gap-3 animate-fade-in font-mono text-xs">
+        <div className="fixed bottom-16 md:bottom-6 right-4 z-50 max-w-sm bg-slate-900 border border-emerald-500/50 text-emerald-400 p-3.5 rounded-lg shadow-2xl flex items-center gap-3 font-mono text-xs">
           <RotateCcw className="w-5 h-5 shrink-0 text-emerald-400" />
           <p className="flex-1 text-slate-200">{refundToast.message}</p>
         </div>
       )}
+
+      {/* Floating Strategy Entry Push Notification Toast */}
+      {strategyPushToast.show && (
+        <div
+          role="status"
+          className={`fixed right-4 z-50 max-w-md bg-slate-900 border border-amber-500/60 p-3.5 rounded-lg shadow-2xl flex items-start gap-3 font-mono text-xs ${
+            refundToast.show ? 'bottom-36 md:bottom-24' : 'bottom-16 md:bottom-6'
+          }`}
+        >
+          <BellRing className="w-5 h-5 shrink-0 text-amber-400 mt-0.5" aria-hidden="true" />
+          <div className="flex-1 min-w-0">
+            <p className="font-bold text-amber-300 truncate">{strategyPushToast.title}</p>
+            <p className="text-slate-200 mt-1 leading-relaxed">{strategyPushToast.message}</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setStrategyPushToast((p) => ({ ...p, show: false }))}
+            className="text-slate-400 hover:text-slate-200 whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* Floating Trade Open/Close Execution Alert Toast */}
+      {tradeAlertToast.show && (
+        <div
+          role="status"
+          className={`fixed left-4 z-50 max-w-md bg-slate-900 border p-3.5 rounded-lg shadow-2xl flex items-start gap-3 font-mono text-xs ${
+            tradeAlertToast.eventType === 'TRADE_CLOSED'
+              ? 'border-emerald-500/60'
+              : 'border-amber-500/60'
+          } bottom-16 md:bottom-6`}
+        >
+          <BellRing
+            className={`w-5 h-5 shrink-0 mt-0.5 ${
+              tradeAlertToast.eventType === 'TRADE_CLOSED' ? 'text-emerald-400' : 'text-amber-400'
+            }`}
+            aria-hidden="true"
+          />
+          <div className="flex-1 min-w-0">
+            <p className="font-bold text-slate-100 truncate">{tradeAlertToast.title}</p>
+            <p className="text-slate-300 mt-1 leading-relaxed">{tradeAlertToast.message}</p>
+            {tradeAlertToast.positionId && (
+              <button
+                type="button"
+                onClick={() => {
+                  handleJumpToPositions(tradeAlertToast.positionId);
+                  setTradeAlertToast((p) => ({ ...p, show: false }));
+                }}
+                className="mt-2 px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-300 text-[11px] font-semibold cursor-pointer"
+              >
+                Inspect Position →
+              </button>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => setTradeAlertToast((p) => ({ ...p, show: false }))}
+            className="text-slate-400 hover:text-slate-200 whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* Quick Jump Command Palette Modal (Ctrl+K) */}
+      <CommandPaletteModal
+        isOpen={isCommandPaletteOpen}
+        onClose={() => setIsCommandPaletteOpen(false)}
+        userRole={userSession.role}
+        onSelectWorkspace={(id) => {
+          setActiveWorkspace(id);
+          setIsMobileMenuOpen(false);
+        }}
+        onSelectCommodity={(c) => setCurrentCommodity(c)}
+        onSelectPortfolioTab={(tab) => {
+          setActiveWorkspace('portfolio');
+          setRequestedPortfolioTab(tab);
+          setIsMobileMenuOpen(false);
+        }}
+      />
 
       {/* Stripe Native Checkout Modal */}
       <StripeCheckoutModal
@@ -1474,52 +2523,78 @@ export default function App() {
         targetFeatureName={targetRestrictedFeature}
       />
 
-      {/* Mobile Bottom Quick Navigation Bar (Touch-friendly Thumb Dock) */}
-      <nav className="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-slate-950/95 backdrop-blur-md border-t border-slate-800 px-3 py-1.5 flex items-center justify-around text-[10px] font-mono text-slate-400">
-        <button
-          onClick={() => setActiveWorkspace('overview')}
-          className={`flex flex-col items-center gap-0.5 py-1 px-2.5 rounded transition-colors ${
-            activeWorkspace === 'overview' ? 'text-amber-400 font-bold' : 'hover:text-slate-200'
-          }`}
+      {/* Strategy Bias Rationale Modal */}
+      <StrategyBiasRationaleModal
+        isOpen={rationaleModalHorizon !== null}
+        onClose={() => setRationaleModalHorizon(null)}
+        quote={activeQuote}
+        candles={candles}
+        indicators={indicators}
+        tradePlans={tradePlans}
+        selectedHorizon={rationaleModalHorizon || overviewRationaleHorizon}
+        onHorizonChange={(h) => setRationaleModalHorizon(h)}
+      />
+
+      {/* Mobile Bottom Quick Navigation Bar (Active inside Terminal only; never overlays Landing Page) */}
+      {!isLandingPageActive && (
+        <nav
+          aria-label="Mobile Quick Navigation"
+          className="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-slate-950/95 backdrop-blur-md border-t border-slate-800 px-2 pt-1.5 pb-safe flex items-center justify-around text-[10px] font-mono text-slate-400"
         >
-          <LayoutDashboard className="w-4 h-4" />
-          <span>Overview</span>
-        </button>
-        <button
-          onClick={() => setActiveWorkspace('terminal')}
-          className={`flex flex-col items-center gap-0.5 py-1 px-2.5 rounded transition-colors ${
-            activeWorkspace === 'terminal' ? 'text-amber-400 font-bold' : 'hover:text-slate-200'
-          }`}
-        >
-          <CandlestickChart className="w-4 h-4" />
-          <span>Terminal</span>
-        </button>
-        <button
-          onClick={() => setActiveWorkspace('technical')}
-          className={`flex flex-col items-center gap-0.5 py-1 px-2.5 rounded transition-colors ${
-            activeWorkspace === 'technical' ? 'text-amber-400 font-bold' : 'hover:text-slate-200'
-          }`}
-        >
-          <Activity className="w-4 h-4" />
-          <span>Technicals</span>
-        </button>
-        <button
-          onClick={() => setActiveWorkspace('monetization')}
-          className={`flex flex-col items-center gap-0.5 py-1 px-2.5 rounded transition-colors ${
-            activeWorkspace === 'monetization' ? 'text-amber-400 font-bold' : 'hover:text-slate-200'
-          }`}
-        >
-          <span className="font-bold text-amber-400">⬡ {entitlements.creditsBalance}</span>
-          <span>Pricing</span>
-        </button>
-        <button
-          onClick={() => setIsMobileMenuOpen(true)}
-          className="flex flex-col items-center gap-0.5 py-1 px-2.5 rounded text-amber-400 hover:text-amber-300 transition-colors"
-        >
-          <Menu className="w-4 h-4" />
-          <span>Workspaces</span>
-        </button>
-      </nav>
+          <button
+            type="button"
+            onClick={() => setActiveWorkspace('overview')}
+            className={`flex flex-col items-center justify-center gap-0.5 min-h-[44px] px-2 rounded transition-colors cursor-pointer ${
+              activeWorkspace === 'overview' ? 'text-amber-400 font-bold' : 'hover:text-slate-200'
+            }`}
+          >
+            <LayoutDashboard className="w-4 h-4" />
+            <span>Overview</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveWorkspace('terminal')}
+            className={`flex flex-col items-center justify-center gap-0.5 min-h-[44px] px-2 rounded transition-colors cursor-pointer ${
+              activeWorkspace === 'terminal' ? 'text-amber-400 font-bold' : 'hover:text-slate-200'
+            }`}
+          >
+            <CandlestickChart className="w-4 h-4" />
+            <span>Terminal</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveWorkspace('technical')}
+            className={`flex flex-col items-center justify-center gap-0.5 min-h-[44px] px-2 rounded transition-colors cursor-pointer ${
+              activeWorkspace === 'technical' ? 'text-amber-400 font-bold' : 'hover:text-slate-200'
+            }`}
+          >
+            <Activity className="w-4 h-4" />
+            <span>Technicals</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => handleJumpToPositions()}
+            className={`flex flex-col items-center justify-center gap-0.5 min-h-[44px] px-2 rounded transition-colors cursor-pointer ${
+              activeWorkspace === 'portfolio' ? 'text-amber-400 font-bold' : 'hover:text-slate-200'
+            }`}
+          >
+            <BookOpen className="w-4 h-4" />
+            <span className="tabular-nums">
+              {userPortfolioPositions.filter((p) => p.status === 'OPEN').length > 0
+                ? `Positions (${userPortfolioPositions.filter((p) => p.status === 'OPEN').length})`
+                : 'Portfolio'}
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setIsMobileMenuOpen(true)}
+            className="flex flex-col items-center justify-center gap-0.5 min-h-[44px] px-2 rounded text-amber-400 hover:text-amber-300 transition-colors cursor-pointer"
+          >
+            <Menu className="w-4 h-4" />
+            <span>Workspaces</span>
+          </button>
+        </nav>
+      )}
     </div>
   );
 }

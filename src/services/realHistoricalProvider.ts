@@ -24,6 +24,11 @@ import {
 } from '../domain/types';
 import { calculateIndicatorsForSeries, generateIndicatorSnapshot } from './indicators';
 import { generateMultiCommodityHistory, HistoricalChartPayload } from './historicalDataEngine';
+import {
+  buildHistoricalYearAnalogCandles,
+  HISTORICAL_YEAR_ANALOG_PRESETS,
+  HistoricalYearSeriesPayload,
+} from './macroData';
 
 // Mapping Instrument to Yahoo Finance Real Market Ticker
 export const YAHOO_SYMBOL_MAP: Record<InstrumentId, string> = {
@@ -240,15 +245,25 @@ export async function fetchRealHistoricalChartData(
     const result = await fetchYahooChartResult(symbol, queryString);
     let rawCandles = parseCandlesFromResult(result);
 
-    // If query resulted in too few bars on short periods, automatically retry with finer intraday resolution
-    if (rawCandles.length < 15 && (period === '1D' || period === '5D')) {
-      const retryQuery = period === '1D' ? 'range=1d&interval=5m' : 'range=5d&interval=15m';
+    // If query resulted in too few bars on short periods, automatically retry with finer or rolling 5d intraday resolution
+    if (rawCandles.length < 50 && period === '1D') {
       try {
-        const retryResult = await fetchYahooChartResult(symbol, retryQuery);
+        const retryResult = await fetchYahooChartResult(symbol, 'range=5d&interval=5m');
+        const retryCandles = parseCandlesFromResult(retryResult);
+        if (retryCandles.length > rawCandles.length) {
+          rawCandles = retryCandles.slice(-144);
+          granularity = '5m';
+        }
+      } catch (retryErr) {
+        // Continue with original rawCandles
+      }
+    } else if (rawCandles.length < 15 && period === '5D') {
+      try {
+        const retryResult = await fetchYahooChartResult(symbol, 'range=5d&interval=15m');
         const retryCandles = parseCandlesFromResult(retryResult);
         if (retryCandles.length > rawCandles.length) {
           rawCandles = retryCandles;
-          granularity = period === '1D' ? '5m' : '15m';
+          granularity = '15m';
         }
       } catch (retryErr) {
         // Continue with original rawCandles
@@ -368,3 +383,58 @@ function mapPeriodToYahooParams(period: HistoricalRangePeriod): {
       return { range: '5y', interval: '1d', tf: '1D' };
   }
 }
+
+const yearAnalogCache = new Map<string, { timestamp: number; payload: HistoricalYearSeriesPayload }>();
+const YEAR_ANALOG_CACHE_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Fetches a secondary historical daily OHLC series for a specific calendar year (e.g., 2008 or 2020)
+ * from Yahoo Finance COMEX Gold (GC=F) or active instrument, with calibrated historical fallback.
+ */
+export async function fetchHistoricalYearComparisonData(
+  yearInput: number,
+  instrumentId: InstrumentId = 'XAUUSD'
+): Promise<HistoricalYearSeriesPayload> {
+  const year = Math.max(1990, Math.min(2025, Math.round(Number(yearInput) || 2020)));
+  const cacheKey = `${instrumentId}_${year}`;
+  const cached = yearAnalogCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < YEAR_ANALOG_CACHE_TTL_MS) {
+    return cached.payload;
+  }
+
+  const preset = HISTORICAL_YEAR_ANALOG_PRESETS.find((p) => p.year === year);
+  const symbol = YAHOO_SYMBOL_MAP[instrumentId] || 'GC=F';
+  const period1 = Math.floor(Date.UTC(year, 0, 1, 0, 0, 0) / 1000);
+  const period2 = Math.floor(Date.UTC(year, 11, 31, 23, 59, 59) / 1000);
+
+  try {
+    const result = await fetchYahooChartResult(symbol, `period1=${period1}&period2=${period2}&interval=1d`);
+    const parsedCandles = parseCandlesFromResult(result).filter((c) => {
+      const yr = new Date(c.timestamp).getUTCFullYear();
+      return yr === year;
+    });
+
+    if (parsedCandles.length >= 20) {
+      const payload: HistoricalYearSeriesPayload = {
+        year,
+        label: preset?.label ?? `${year} Historical ${instrumentId}`,
+        macroContext:
+          preset?.macroContext ??
+          `Real exchange-settled ${instrumentId} (${symbol}) daily trajectory for ${year}.`,
+        startDate: parsedCandles[0].timeStr.slice(0, 10),
+        endDate: parsedCandles[parsedCandles.length - 1].timeStr.slice(0, 10),
+        source: 'YAHOO_LIVE',
+        candles: parsedCandles,
+      };
+      yearAnalogCache.set(cacheKey, { timestamp: Date.now(), payload });
+      return payload;
+    }
+  } catch (err: any) {
+    console.warn(`Historical year analog fetch fallback for ${instrumentId} ${year}:`, err?.message || err);
+  }
+
+  const fallbackPayload = buildHistoricalYearAnalogCandles(year);
+  yearAnalogCache.set(cacheKey, { timestamp: Date.now(), payload: fallbackPayload });
+  return fallbackPayload;
+}
+

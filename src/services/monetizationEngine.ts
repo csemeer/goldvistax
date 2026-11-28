@@ -140,6 +140,11 @@ export const BROKER_PARTNERS: BrokerPartner[] = [
 
 const STORAGE_KEY = 'goldvista_user_entitlements_v1';
 
+function getEntitlementStorageKey(userId?: string): string {
+  const normalized = typeof userId === 'string' ? userId.trim() : '';
+  return normalized ? `${STORAGE_KEY}:${normalized}` : STORAGE_KEY;
+}
+
 export function getInitialEntitlements(): UserEntitlementState {
   const nowIso = new Date().toISOString();
   return {
@@ -203,35 +208,40 @@ function appendLedgerEntry(
   };
 }
 
-export function loadUserEntitlements(): UserEntitlementState {
+export function loadUserEntitlements(userId?: string): UserEntitlementState {
+  const storageKey = getEntitlementStorageKey(userId);
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
-      const raw = window.localStorage.getItem(STORAGE_KEY);
+      const raw = window.localStorage.getItem(storageKey);
       if (raw) {
         const parsed: UserEntitlementState = JSON.parse(raw);
         // Auto regen check on load
-        return checkAndApplyDailyRegen(parsed);
+        return checkAndApplyDailyRegen(parsed, userId);
       }
     }
   } catch (e) {
     console.warn('Failed to load user entitlements from storage:', e);
   }
   const initial = getInitialEntitlements();
-  saveUserEntitlements(initial);
+  saveUserEntitlements(initial, userId);
   return initial;
 }
 
-export function saveUserEntitlements(state: UserEntitlementState): void {
+export function saveUserEntitlements(state: UserEntitlementState, userId?: string): void {
+  const storageKey = getEntitlementStorageKey(userId);
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      window.localStorage.setItem(storageKey, JSON.stringify(state));
     }
   } catch (e) {
     console.warn('Failed to save user entitlements to storage:', e);
   }
 }
 
-export function checkAndApplyDailyRegen(state: UserEntitlementState): UserEntitlementState {
+export function checkAndApplyDailyRegen(
+  state: UserEntitlementState,
+  userId?: string
+): UserEntitlementState {
   const now = Date.now();
   const oneDayMs = 24 * 60 * 60 * 1000;
   if (now - state.lastDailyRegenTimestamp >= oneDayMs) {
@@ -252,14 +262,14 @@ export function checkAndApplyDailyRegen(state: UserEntitlementState): UserEntitl
         lastDailyRegenTimestamp: now,
         creditLedger: ledgerRes.ledger,
       };
-      saveUserEntitlements(updated);
+      saveUserEntitlements(updated, userId);
       return updated;
     }
     const updated: UserEntitlementState = {
       ...state,
       lastDailyRegenTimestamp: now,
     };
-    saveUserEntitlements(updated);
+    saveUserEntitlements(updated, userId);
     return updated;
   }
   return state;
@@ -282,7 +292,8 @@ export function unlockPlanWithGuarantee(
   planId: string,
   stopPrice: number,
   targetPrice: number,
-  direction: 'BUY' | 'SELL'
+  direction: 'BUY' | 'SELL',
+  userId?: string
 ): { success: boolean; updatedState: UserEntitlementState; message: string } {
   // If already unlocked
   if (isPlanUnlocked(state, planId)) {
@@ -338,7 +349,7 @@ export function unlockPlanWithGuarantee(
     creditLedger: ledgerRes.ledger,
   };
 
-  saveUserEntitlements(updatedState);
+  saveUserEntitlements(updatedState, userId);
   return {
     success: true,
     updatedState,
@@ -352,7 +363,8 @@ export function unlockPlanWithGuarantee(
  */
 export function evaluatePerformanceRefunds(
   state: UserEntitlementState,
-  currentPrice: number
+  currentPrice: number,
+  userId?: string
 ): { refundedCount: number; updatedState: UserEntitlementState; refundedPlanIds: string[] } {
   let workingState = state;
   let refundedCount = 0;
@@ -403,7 +415,7 @@ export function evaluatePerformanceRefunds(
       ...workingState,
       unlockedPlans: updatedPlans,
     };
-    saveUserEntitlements(finalState);
+    saveUserEntitlements(finalState, userId);
     return { refundedCount, updatedState: finalState, refundedPlanIds };
   }
 
@@ -416,7 +428,8 @@ export function evaluatePerformanceRefunds(
 export function linkBrokerPartnerAccount(
   state: UserEntitlementState,
   brokerId: string,
-  accountNo: string
+  accountNo: string,
+  userId?: string
 ): UserEntitlementState {
   const ledgerRes = appendLedgerEntry(
     state,
@@ -434,7 +447,7 @@ export function linkBrokerPartnerAccount(
     estimatedMoneySavedDollars: state.estimatedMoneySavedDollars + 588,
     creditLedger: ledgerRes.ledger,
   };
-  saveUserEntitlements(updated);
+  saveUserEntitlements(updated, userId);
   return updated;
 }
 
@@ -443,7 +456,8 @@ export function linkBrokerPartnerAccount(
  */
 export function purchaseCreditPack(
   state: UserEntitlementState,
-  packId: string
+  packId: string,
+  userId?: string
 ): UserEntitlementState {
   const pack = CREDIT_PACKS.find((p) => p.id === packId) || CREDIT_PACKS[0];
   const totalCredits = pack.credits + pack.bonusCredits;
@@ -460,7 +474,7 @@ export function purchaseCreditPack(
     estimatedMoneySavedDollars: state.estimatedMoneySavedDollars + totalCredits * 35,
     creditLedger: ledgerRes.ledger,
   };
-  saveUserEntitlements(updated);
+  saveUserEntitlements(updated, userId);
   return updated;
 }
 
@@ -469,7 +483,8 @@ export function purchaseCreditPack(
  */
 export function upgradeMembershipTier(
   state: UserEntitlementState,
-  newTier: MembershipTier
+  newTier: MembershipTier,
+  userId?: string
 ): UserEntitlementState {
   const tierGrant = newTier === 'ALPHA' ? 500 : 100;
   const ledgerRes = appendLedgerEntry(
@@ -487,7 +502,7 @@ export function upgradeMembershipTier(
     estimatedMoneySavedDollars: state.estimatedMoneySavedDollars + (newTier === 'ALPHA' ? 2400 : 600),
     creditLedger: ledgerRes.ledger,
   };
-  saveUserEntitlements(updated);
+  saveUserEntitlements(updated, userId);
   return updated;
 }
 

@@ -354,10 +354,13 @@ export class MarketDataRouter {
       throw new Error(`Market data unavailable for ${instrumentId} across all configured providers.`);
     }
 
+    const qualityInfo = getDataQualityStatus(raw.sourceTimestamp);
     const derivedQuality =
       raw.classification === 'SIMULATED'
         ? 'QUALITY_HOLD'
-        : getDataQualityStatus(raw.sourceTimestamp).status;
+        : this.config.allowDelayed && qualityInfo.status === 'STALE' && qualityInfo.ageSeconds < 900
+        ? 'DEGRADED'
+        : qualityInfo.status;
 
     // Build canonical Quote object
     const canonicalQuote: Quote = {

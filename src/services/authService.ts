@@ -45,6 +45,102 @@ export interface AccessCheckResult {
 
 const STORAGE_SESSION_KEY = 'goldvista_user_session_v2';
 const STORAGE_SIGNED_TOKEN_KEY = 'goldvista_signed_bearer_v1';
+const STORAGE_ACCOUNTS_KEY = 'goldvista_registered_accounts_v1';
+
+export interface RegisteredAccountRecord {
+  uid: string;
+  email: string;
+  displayName: string;
+  passwordHash?: string;
+  authProvider: AuthProviderType;
+  role: UserRole;
+  tradingProfile?: UserTradingProfile;
+  enrolledAt: string;
+  isVerified: boolean;
+  linkedBrokerId?: string;
+  brokerAccountNumber?: string;
+}
+
+const inMemoryAccountsDirectory = new Map<string, RegisteredAccountRecord>();
+let inMemorySessionFallback: UserSession | null = null;
+
+function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
+
+export function isValidEmailAddress(email: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+}
+
+/**
+ * Deterministic salted credential digest helper that works identically in browser & Node runtimes.
+ */
+function hashCredentialSecret(secret: string, saltEmail: string): string {
+  const input = `gv_auth_v1:${normalizeEmail(saltEmail)}:${secret}`;
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+  for (let i = 0; i < input.length; i++) {
+    const code = input.charCodeAt(i);
+    h1 ^= code;
+    h1 = Math.imul(h1, 0x01000193);
+    h2 ^= code + ((h1 >>> 16) & 0xff);
+    h2 = Math.imul(h2, 0x85ebca6b);
+  }
+  return `h1_${(h1 >>> 0).toString(16).padStart(8, '0')}${(h2 >>> 0).toString(16).padStart(8, '0')}`;
+}
+
+function deterministicUidForEmail(email: string, prefix = 'usr_em'): string {
+  const digest = hashCredentialSecret(normalizeEmail(email), 'uid_namespace').replace('h1_', '');
+  return `${prefix}_${digest.slice(0, 10)}`;
+}
+
+function readRegisteredAccountsDirectory(): Record<string, RegisteredAccountRecord> {
+  const merged: Record<string, RegisteredAccountRecord> = {};
+  for (const [k, v] of inMemoryAccountsDirectory.entries()) {
+    merged[k] = v;
+  }
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const raw = window.localStorage.getItem(STORAGE_ACCOUNTS_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as Record<string, RegisteredAccountRecord>;
+        if (parsed && typeof parsed === 'object') {
+          for (const [k, v] of Object.entries(parsed)) {
+            if (v && v.uid && v.email) {
+              merged[normalizeEmail(k)] = v;
+              inMemoryAccountsDirectory.set(normalizeEmail(k), v);
+            }
+          }
+        }
+      }
+    }
+  } catch {
+    // ignore storage read error
+  }
+  return merged;
+}
+
+function writeRegisteredAccountRecord(record: RegisteredAccountRecord): void {
+  const key = normalizeEmail(record.email);
+  inMemoryAccountsDirectory.set(key, record);
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const current = readRegisteredAccountsDirectory();
+      current[key] = record;
+      window.localStorage.setItem(STORAGE_ACCOUNTS_KEY, JSON.stringify(current));
+    }
+  } catch {
+    // ignore storage write error
+  }
+}
+
+export function findRegisteredAccountByEmail(email: string): RegisteredAccountRecord | null {
+  const key = normalizeEmail(email);
+  if (!key) return null;
+  const directory = readRegisteredAccountsDirectory();
+  if (directory[key]) return directory[key];
+  return null;
+}
 
 interface CachedSignedToken {
   role: UserRole;
@@ -245,44 +341,64 @@ export async function completeOidcPkceCallback(
 }
 
 let cachedSandboxModeEnabled: boolean | null = null;
+const inFlightTokenRefreshes = new Map<string, Promise<string | null>>();
 
 /**
  * Requests a server-signed HMAC-SHA256 `aurum_v1.` token for active sandbox personas (§6.1).
  * Checks `/api/auth/session-config` first so production runtimes with `ALLOW_SANDBOX_PERSONAS=false`
  * skip sandbox token requests cleanly without console 403 noise.
  */
-export async function refreshSignedSandboxToken(session?: UserSession): Promise<string | null> {
+export async function refreshSignedSandboxToken(
+  session?: UserSession,
+  forceRefresh = false
+): Promise<string | null> {
   const active = session || getCurrentSession();
   if (!active || active.role === 'GUEST' || typeof fetch === 'undefined' || typeof window === 'undefined') {
     return null;
   }
-  try {
-    if (cachedSandboxModeEnabled === null) {
-      const cfgRes = await fetch('/api/auth/session-config');
-      if (cfgRes.ok) {
-        const cfg = (await cfgRes.json()) as { sandboxModeEnabled?: boolean };
-        cachedSandboxModeEnabled = Boolean(cfg?.sandboxModeEnabled);
-      }
-    }
-    if (cachedSandboxModeEnabled === false) {
-      return null;
-    }
 
-    const res = await fetch('/api/auth/sandbox-token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ persona: active.role.toLowerCase(), userId: active.uid }),
-    });
-    if (!res.ok) return null;
-    const data = (await res.json()) as { token?: string; expiresAt?: string };
-    if (data?.token && data.token.startsWith('aurum_v1.')) {
-      setSignedBearerToken(active.role, active.uid, data.token, data.expiresAt);
-      return data.token;
+  const refreshKey = `${active.uid}:${active.role}`;
+  if (!forceRefresh) {
+    const existing = inFlightTokenRefreshes.get(refreshKey);
+    if (existing) {
+      return existing;
     }
-  } catch {
-    // Ignore transient network errors when refreshing sandbox bearer token
   }
-  return null;
+
+  const promise = (async (): Promise<string | null> => {
+    try {
+      if (cachedSandboxModeEnabled === null) {
+        const cfgRes = await fetch('/api/auth/session-config');
+        if (cfgRes.ok) {
+          const cfg = (await cfgRes.json()) as { sandboxModeEnabled?: boolean };
+          cachedSandboxModeEnabled = Boolean(cfg?.sandboxModeEnabled);
+        }
+      }
+      if (cachedSandboxModeEnabled === false) {
+        return null;
+      }
+
+      const res = await fetch('/api/auth/sandbox-token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ persona: active.role.toLowerCase(), userId: active.uid }),
+      });
+      if (!res.ok) return null;
+      const data = (await res.json()) as { token?: string; expiresAt?: string };
+      if (data?.token && data.token.startsWith('aurum_v1.')) {
+        setSignedBearerToken(active.role, active.uid, data.token, data.expiresAt);
+        return data.token;
+      }
+    } catch {
+      // Ignore transient network errors when refreshing sandbox bearer token
+    } finally {
+      inFlightTokenRefreshes.delete(refreshKey);
+    }
+    return null;
+  })();
+
+  inFlightTokenRefreshes.set(refreshKey, promise);
+  return promise;
 }
 
 // Predefined Demo Personas for evaluation & switching
@@ -356,21 +472,26 @@ export const DEMO_PERSONAS: Record<UserRole, UserSession> = {
 };
 
 /**
- * Returns current authenticated user session or initializes with Pro trader default
+ * Returns current authenticated user session or initializes with Guest visitor default
  */
 export function getCurrentSession(): UserSession {
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
       const raw = window.localStorage.getItem(STORAGE_SESSION_KEY);
       if (raw) {
-        return JSON.parse(raw);
+        const parsed = JSON.parse(raw) as UserSession;
+        inMemorySessionFallback = parsed;
+        return parsed;
       }
     }
   } catch (e) {
     console.warn('Failed to load user session from storage:', e);
   }
 
-  // Default to Guest visitor persona for new visitors to initiate enrollment
+  if (inMemorySessionFallback) {
+    return inMemorySessionFallback;
+  }
+
   const initial = DEMO_PERSONAS.GUEST;
   saveSession(initial);
   return initial;
@@ -380,6 +501,7 @@ export function getCurrentSession(): UserSession {
  * Persists session to localStorage
  */
 export function saveSession(session: UserSession): void {
+  inMemorySessionFallback = session;
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
       window.localStorage.setItem(STORAGE_SESSION_KEY, JSON.stringify(session));
@@ -417,6 +539,7 @@ export const WORKSPACE_TIER_REQUIREMENTS: Record<WorkspaceId, UserRole> = {
   macro: 'FREE',
   events: 'FREE',
   portfolio: 'FREE',
+  performance_insights: 'FREE',
   market_data_config: 'FREE',
   alerts: 'FREE',
   strategies: 'PRO',
@@ -454,6 +577,7 @@ export function canAccessWorkspace(
     strategies: 'Quantitative Strategy Lab',
     backtesting: 'Walk-Forward Backtesting Engine',
     portfolio: 'Paper Trading Portfolio & Journal',
+    performance_insights: 'Performance Insights & Trade Analytics',
     council: 'AI Advisory Council & Specialist Agents',
     reports: 'Intelligence Reports & PDF Export',
     alerts: 'Alerts & Market Data Health',
@@ -484,120 +608,290 @@ export function canAccessWorkspace(
         ? 'Upgrade to Institutional Alpha ($199/mo) to unlock private AI specialists and unlimited bespoke models.'
         : requiredRole === 'PRO'
         ? 'Upgrade to Pro ($49/mo) or link an active partner ECN broker account for sponsored access.'
-        : 'Sign in or enroll free (includes 5 welcome signal credits) to access this feature.',
+        : 'Sign in or create a free account (includes 5 welcome signal credits) to access this feature.',
   };
 }
 
 /**
- * Simulates logging in with a social identity provider
+ * Simulates logging in with a social identity provider while preserving deterministic identity continuity.
  */
 export async function loginWithSocialProvider(
   provider: 'google' | 'apple' | 'discord' | 'telegram',
   customEmail?: string
 ): Promise<UserSession> {
-  // Simulate network roundtrip latency
-  await new Promise((r) => setTimeout(r, 600));
+  await new Promise((r) => setTimeout(r, 350));
 
-  const email = customEmail || (provider === 'google' ? 'csemeer@gmail.com' : `trader.${provider}@commodity-alpha.net`);
+  const email = normalizeEmail(customEmail || `trader.${provider}@commodity-alpha.net`);
+  const existing = findRegisteredAccountByEmail(email);
+  if (existing) {
+    const restored: UserSession = {
+      uid: existing.uid,
+      email: existing.email,
+      displayName: existing.displayName,
+      authProvider: existing.authProvider,
+      role: existing.role,
+      tradingProfile: existing.tradingProfile,
+      enrolledAt: existing.enrolledAt,
+      lastLoginAt: new Date().toISOString(),
+      isVerified: existing.isVerified,
+      linkedBrokerId: existing.linkedBrokerId,
+      brokerAccountNumber: existing.brokerAccountNumber,
+    };
+    saveSession(restored);
+    clearSignedBearerToken();
+    void refreshSignedSandboxToken(restored);
+    return restored;
+  }
+
   const displayName =
     provider === 'google'
-      ? 'Alex Vance'
+      ? 'Google Trader'
       : provider === 'apple'
-      ? 'Marcus Chen'
+      ? 'Apple Trader'
       : provider === 'discord'
       ? 'GoldAlpha#4128'
       : 'ApexTrader_TG';
 
-  const avatarUrl =
-    provider === 'google'
-      ? 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=120&h=120&q=80'
-      : provider === 'apple'
-      ? 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=120&h=120&q=80'
-      : '';
+  const role: UserRole = provider === 'google' ? 'ALPHA' : 'PRO';
+  const uid = deterministicUidForEmail(email, `usr_${provider}`);
+  const tradingProfile: UserTradingProfile = {
+    primaryHorizon: 'SWING',
+    brokerName: 'IC Markets Global',
+    accountSize: '$50,000 - $100,000',
+    experienceLevel: 'ADVANCED',
+  };
+  const enrolledAt = new Date().toISOString();
 
-  const session: UserSession = {
-    uid: `usr_${provider}_${Math.random().toString(36).substring(2, 9)}`,
+  writeRegisteredAccountRecord({
+    uid,
     email,
     displayName,
-    avatarUrl,
     authProvider: provider,
-    role: provider === 'google' ? 'ALPHA' : 'PRO',
-    tradingProfile: {
-      primaryHorizon: 'SWING',
-      brokerName: 'IC Markets Global',
-      accountSize: '$50,000 - $100,000',
-      experienceLevel: 'ADVANCED',
-    },
-    enrolledAt: '2026-01-20T08:00:00Z',
+    role,
+    tradingProfile,
+    enrolledAt,
+    isVerified: true,
+  });
+
+  const session: UserSession = {
+    uid,
+    email,
+    displayName,
+    avatarUrl: '',
+    authProvider: provider,
+    role,
+    tradingProfile,
+    enrolledAt,
     lastLoginAt: new Date().toISOString(),
     isVerified: true,
   };
 
   saveSession(session);
+  clearSignedBearerToken();
   void refreshSignedSandboxToken(session);
   return session;
 }
 
 /**
- * Simulates email magic link or password authentication
+ * Authenticates a user by email and optional password, recovering their persistent registered UID
+ * or matching a built-in sandbox persona email. Strict mode enforces existing account & password verification.
  */
 export async function loginWithEmail(
   email: string,
-  _pass?: string
+  pass?: string,
+  options?: { strictRegisteredOnly?: boolean }
 ): Promise<UserSession> {
-  await new Promise((r) => setTimeout(r, 650));
+  await new Promise((r) => setTimeout(r, 350));
 
-  const username = email.split('@')[0] || 'Trader';
-  const session: UserSession = {
-    uid: `usr_em_${Math.random().toString(36).substring(2, 9)}`,
-    email,
-    displayName: username.charAt(0).toUpperCase() + username.slice(1),
+  const normalized = normalizeEmail(email);
+  if (!isValidEmailAddress(normalized)) {
+    throw new Error('Please enter a valid email address.');
+  }
+
+  // 1. Check persisted registered user accounts first so returning users recover their exact UID & portfolio
+  const registered = findRegisteredAccountByEmail(normalized);
+  if (registered) {
+    if (registered.passwordHash) {
+      if (!pass || hashCredentialSecret(pass, normalized) !== registered.passwordHash) {
+        throw new Error('Incorrect password for this account. Please check your credentials.');
+      }
+    }
+    const restored: UserSession = {
+      uid: registered.uid,
+      email: registered.email,
+      displayName: registered.displayName,
+      authProvider: registered.authProvider,
+      role: registered.role,
+      tradingProfile: registered.tradingProfile,
+      enrolledAt: registered.enrolledAt,
+      lastLoginAt: new Date().toISOString(),
+      isVerified: registered.isVerified,
+      linkedBrokerId: registered.linkedBrokerId,
+      brokerAccountNumber: registered.brokerAccountNumber,
+    };
+    saveSession(restored);
+    clearSignedBearerToken();
+    void refreshSignedSandboxToken(restored);
+    return restored;
+  }
+
+  // 2. Check built-in demo personas if their email is entered directly
+  const matchingDemo = (Object.values(DEMO_PERSONAS) as UserSession[]).find(
+    (p) => p.role !== 'GUEST' && normalizeEmail(p.email) === normalized
+  );
+  if (matchingDemo) {
+    const demoSession: UserSession = {
+      ...matchingDemo,
+      lastLoginAt: new Date().toISOString(),
+    };
+    saveSession(demoSession);
+    clearSignedBearerToken();
+    void refreshSignedSandboxToken(demoSession);
+    return demoSession;
+  }
+
+  // 3. In strict credential Sign-In mode (used by Sign In UI with password), reject unknown accounts
+  if (options?.strictRegisteredOnly) {
+    throw new Error('No account found for this email address. Please Sign Up to create an account.');
+  }
+
+  // 4. Legacy single-argument sandbox email login: deterministic UID scoped cleanly to email
+  const username = normalized.split('@')[0] || 'Trader';
+  const uid = deterministicUidForEmail(normalized, 'usr_em');
+  const displayName = username.charAt(0).toUpperCase() + username.slice(1);
+  const enrolledAt = new Date().toISOString();
+  const tradingProfile: UserTradingProfile = {
+    primaryHorizon: 'INTRADAY',
+    experienceLevel: 'INTERMEDIATE',
+  };
+
+  writeRegisteredAccountRecord({
+    uid,
+    email: normalized,
+    displayName,
+    passwordHash: pass ? hashCredentialSecret(pass, normalized) : undefined,
     authProvider: 'email',
     role: 'FREE',
-    tradingProfile: {
-      primaryHorizon: 'INTRADAY',
-      experienceLevel: 'INTERMEDIATE',
-    },
-    enrolledAt: new Date().toISOString(),
+    tradingProfile,
+    enrolledAt,
+    isVerified: true,
+  });
+
+  const session: UserSession = {
+    uid,
+    email: normalized,
+    displayName,
+    authProvider: 'email',
+    role: 'FREE',
+    tradingProfile,
+    enrolledAt,
     lastLoginAt: new Date().toISOString(),
     isVerified: true,
   };
 
   saveSession(session);
+  clearSignedBearerToken();
   void refreshSignedSandboxToken(session);
   return session;
 }
 
 /**
- * Enrolls a brand new customer through the multi-step questionnaire
+ * Registers a brand new customer with persistent credentials, duplicate email guard,
+ * and tailored trading profile.
  */
 export async function enrollNewCustomer(data: {
   email: string;
   displayName: string;
   authProvider: AuthProviderType;
   tradingProfile: UserTradingProfile;
+  password?: string;
+  rejectDuplicate?: boolean;
 }): Promise<UserSession> {
-  await new Promise((r) => setTimeout(r, 800));
+  await new Promise((r) => setTimeout(r, 450));
+
+  const normalized = normalizeEmail(data.email);
+  if (!isValidEmailAddress(normalized)) {
+    throw new Error('Please provide a valid institutional or personal email address.');
+  }
+  if (data.password !== undefined && data.password.length < 8) {
+    throw new Error('Password must be at least 8 characters long.');
+  }
+
+  const existing = findRegisteredAccountByEmail(normalized);
+  if (existing && data.rejectDuplicate) {
+    throw new Error('An account with this email is already registered. Please Sign In instead.');
+  }
+
+  const uid = existing ? existing.uid : deterministicUidForEmail(normalized, 'usr_new');
+  const displayName = data.displayName.trim() || normalized.split('@')[0] || 'Commodity Trader';
+  const enrolledAt = existing?.enrolledAt || new Date().toISOString();
+
+  writeRegisteredAccountRecord({
+    uid,
+    email: normalized,
+    displayName,
+    passwordHash: data.password ? hashCredentialSecret(data.password, normalized) : existing?.passwordHash,
+    authProvider: data.authProvider,
+    role: existing?.role || 'FREE',
+    tradingProfile: data.tradingProfile,
+    enrolledAt,
+    isVerified: true,
+    linkedBrokerId: existing?.linkedBrokerId,
+    brokerAccountNumber: existing?.brokerAccountNumber,
+  });
 
   const session: UserSession = {
-    uid: `usr_new_${Math.random().toString(36).substring(2, 9)}`,
-    email: data.email,
-    displayName: data.displayName || data.email.split('@')[0],
+    uid,
+    email: normalized,
+    displayName,
     authProvider: data.authProvider,
-    role: 'FREE',
+    role: existing?.role || 'FREE',
     tradingProfile: data.tradingProfile,
-    enrolledAt: new Date().toISOString(),
+    enrolledAt,
     lastLoginAt: new Date().toISOString(),
     isVerified: true,
   };
 
   saveSession(session);
+  clearSignedBearerToken();
   void refreshSignedSandboxToken(session);
   return session;
 }
 
 /**
- * Switches the active persona (for testing all roles without logging out)
+ * Updates the signed-in user's membership tier in place while preserving their exact UID,
+ * email, display name, and private portfolio ledger.
+ */
+export function updateCurrentUserTier(newRole: Exclude<UserRole, 'GUEST'>): UserSession {
+  const current = getCurrentSession();
+  if (!current || current.role === 'GUEST') {
+    return switchPersona(newRole);
+  }
+
+  const updated: UserSession = {
+    ...current,
+    role: newRole,
+    lastLoginAt: new Date().toISOString(),
+  };
+
+  if (updated.email) {
+    const existing = findRegisteredAccountByEmail(updated.email);
+    if (existing) {
+      writeRegisteredAccountRecord({
+        ...existing,
+        role: newRole,
+      });
+    }
+  }
+
+  saveSession(updated);
+  clearSignedBearerToken();
+  void refreshSignedSandboxToken(updated, true);
+  return updated;
+}
+
+/**
+ * Switches the active persona (for testing demo sandbox accounts explicitly without signing up)
  */
 export function switchPersona(role: UserRole): UserSession {
   const template = DEMO_PERSONAS[role];
@@ -610,7 +904,7 @@ export function switchPersona(role: UserRole): UserSession {
     clearSignedBearerToken();
   } else {
     clearSignedBearerToken();
-    void refreshSignedSandboxToken(session);
+    void refreshSignedSandboxToken(session, true);
   }
   return session;
 }
@@ -627,7 +921,8 @@ export function logoutUser(): UserSession {
 
 /**
  * Generates or retrieves an API Bearer token aligned with the active browser session persona.
- * Prefers server-issued HMAC-SHA256 `aurum_v1.` tokens when cached; falls back to dev `aurum_sess_` token otherwise.
+ * Prefers server-issued HMAC-SHA256 `aurum_v1.` tokens when cached; falls back to dev `aurum_sess_` token
+ * carrying `.uid_<uid>` so distinct users remain strictly isolated on the server.
  */
 export function getSessionBearerToken(session?: UserSession): string {
   const active = session || getCurrentSession();
@@ -639,5 +934,33 @@ export function getSessionBearerToken(session?: UserSession): string {
     return cached.token;
   }
   const expUnix = Math.floor(Date.now() / 1000) + 3600;
-  return `aurum_sess_${active.role.toLowerCase()}_${expUnix}`;
+  const uidSuffix = active.uid ? `.uid_${encodeURIComponent(active.uid)}` : '';
+  return `aurum_sess_${active.role.toLowerCase()}_${expUnix}${uidSuffix}`;
+}
+
+/**
+ * Ensures a signed `aurum_v1.` bearer token (bound to `active.uid`) is acquired
+ * before making tenant-scoped API calls, clearing stale tokens when `forceRefresh` is true.
+ */
+export async function ensureSignedBearerToken(
+  session?: UserSession,
+  forceRefresh = false
+): Promise<string> {
+  const active = session || getCurrentSession();
+  if (!active || active.role === 'GUEST') {
+    return '';
+  }
+  if (forceRefresh) {
+    clearSignedBearerToken();
+  } else {
+    const cached = readCachedSignedToken();
+    if (cached && cached.role === active.role && cached.uid === active.uid) {
+      return cached.token;
+    }
+  }
+  const refreshed = await refreshSignedSandboxToken(active, forceRefresh);
+  if (refreshed) {
+    return refreshed;
+  }
+  return getSessionBearerToken(active);
 }

@@ -5,7 +5,8 @@
  * Hard limits, position sizing, margin requirements, transaction costs, and abstention rules.
  */
 
-import { CFDCalculationResult, InstrumentSpecification } from '../domain/types';
+import { CFDCalculationResult, InstrumentSpecification, TradePlan } from '../domain/types';
+import { CANONICAL_COMMODITY_REGISTRY } from './commodityRegistry';
 
 export const DEFAULT_GOLD_SPECIFICATION: InstrumentSpecification = {
   id: 'XAUUSD',
@@ -436,4 +437,155 @@ export function simulatePropFirmPassProbability(
     expectedDays,
   };
 }
+
+// -------------------------------------------------------------
+// TRADE PLAN P&L PROJECTION & RISK-BASED POSITION SIZING
+// -------------------------------------------------------------
+
+export interface TradePlanPnlProjectionInput {
+  plan: TradePlan;
+  accountSize: number;
+  riskPercent: number;
+}
+
+export interface TradePlanPnlProjection {
+  isActionable: boolean;
+  unitLabel: 'lots' | 'contracts' | 'shares';
+  contractSize: number;
+  lotIncrement: number;
+  entryRefPrice: number;
+  stopDistance: number;
+  riskBudgetUsd: number;
+  rawPositionSize: number;
+  suggestedSize: number;
+  notionalExposureUsd: number;
+  projectedStopLossPnl: number;
+  projectedTarget1Pnl: number;
+  projectedTarget2Pnl: number;
+  projectedTarget3Pnl: number;
+  stopLossReturnPct: number;
+  target1ReturnPct: number;
+  target2ReturnPct: number;
+  target3ReturnPct: number;
+  belowMinIncrement: boolean;
+  exceedsInstitutionalRiskLimit: boolean;
+  warningMessage?: string;
+}
+
+export function calculateTradePlanPnlProjection(
+  input: TradePlanPnlProjectionInput
+): TradePlanPnlProjection {
+  const { plan, accountSize, riskPercent } = input;
+  const spec = CANONICAL_COMMODITY_REGISTRY[plan.instrumentId];
+  const contractSize = spec?.contractSize && spec.contractSize > 0 ? spec.contractSize : 100;
+  const lotIncrement = spec?.lotIncrement && spec.lotIncrement > 0 ? spec.lotIncrement : 0.01;
+  const unitLabel: TradePlanPnlProjection['unitLabel'] =
+    spec?.assetClass === 'ETF'
+      ? 'shares'
+      : spec?.assetClass === 'FUTURES'
+      ? 'contracts'
+      : 'lots';
+
+  const entryRefPrice =
+    plan.triggerPrice && plan.triggerPrice > 0
+      ? plan.triggerPrice
+      : (plan.entryZoneMin + plan.entryZoneMax) / 2;
+
+  const stopDistance = Number(
+    Math.max(
+      0,
+      plan.riskDistance > 0
+        ? plan.riskDistance
+        : Math.abs(entryRefPrice - plan.stopLossPrice)
+    ).toFixed(4)
+  );
+
+  const safeAccountSize = Number.isFinite(accountSize) && accountSize > 0 ? accountSize : 0;
+  const safeRiskPercent = Number.isFinite(riskPercent) && riskPercent > 0 ? riskPercent : 0;
+  const riskBudgetUsd = Number(((safeAccountSize * safeRiskPercent) / 100).toFixed(2));
+
+  const isActionable =
+    !plan.isAbstained &&
+    plan.direction !== 'NO_TRADE' &&
+    plan.direction !== 'HOLD' &&
+    stopDistance > 0;
+
+  const incrementDecimals = lotIncrement < 1 ? Math.max(0, Math.ceil(-Math.log10(lotIncrement))) : 0;
+  const roundToPrecision = (val: number, decimals: number) => Number(val.toFixed(decimals));
+
+  let rawPositionSize = 0;
+  let suggestedSize = 0;
+
+  if (isActionable && safeAccountSize > 0 && safeRiskPercent > 0) {
+    rawPositionSize = riskBudgetUsd / (stopDistance * contractSize);
+    const steps = Math.floor(rawPositionSize / lotIncrement + 1e-9);
+    suggestedSize = roundToPrecision(steps * lotIncrement, incrementDecimals);
+  }
+
+  const belowMinIncrement = isActionable && rawPositionSize > 0 && suggestedSize < lotIncrement;
+  const exceedsInstitutionalRiskLimit = safeRiskPercent > 5.0;
+
+  const isSell = plan.direction === 'SELL';
+  const t1Distance = isActionable
+    ? Math.max(0, isSell ? entryRefPrice - plan.target1Price : plan.target1Price - entryRefPrice)
+    : 0;
+  const t2Distance = isActionable
+    ? Math.max(0, isSell ? entryRefPrice - plan.target2Price : plan.target2Price - entryRefPrice)
+    : 0;
+  const t3Distance = isActionable
+    ? Math.max(0, isSell ? entryRefPrice - plan.target3Price : plan.target3Price - entryRefPrice)
+    : 0;
+
+  const projectedStopLossPnl =
+    suggestedSize > 0 ? -Number((suggestedSize * stopDistance * contractSize).toFixed(2)) : 0;
+  const projectedTarget1Pnl =
+    suggestedSize > 0 ? Number((suggestedSize * t1Distance * contractSize).toFixed(2)) : 0;
+  const projectedTarget2Pnl =
+    suggestedSize > 0 ? Number((suggestedSize * t2Distance * contractSize).toFixed(2)) : 0;
+  const projectedTarget3Pnl =
+    suggestedSize > 0 ? Number((suggestedSize * t3Distance * contractSize).toFixed(2)) : 0;
+
+  const notionalExposureUsd = Number((suggestedSize * entryRefPrice * contractSize).toFixed(2));
+
+  const toPct = (pnl: number) =>
+    safeAccountSize > 0 ? Number(((pnl / safeAccountSize) * 100).toFixed(2)) : 0;
+
+  let warningMessage: string | undefined;
+  if (plan.isAbstained || plan.direction === 'NO_TRADE' || plan.direction === 'HOLD') {
+    warningMessage = 'Position sizing is withheld while setup is on HOLD or NO_TRADE abstention.';
+  } else if (stopDistance <= 0) {
+    warningMessage = 'Valid stop-loss distance is required to compute risk-adjusted size.';
+  } else if (safeAccountSize <= 0 || safeRiskPercent <= 0) {
+    warningMessage = 'Enter a positive account size and risk % to project position sizing.';
+  } else if (exceedsInstitutionalRiskLimit) {
+    warningMessage = 'Risk exceeds 5.0% institutional ceiling per trade. Consider reducing allocation.';
+  } else if (belowMinIncrement) {
+    warningMessage = `Risk budget ($${riskBudgetUsd.toFixed(2)}) is below the ${lotIncrement} ${unitLabel} minimum step for a $${stopDistance.toFixed(2)} stop.`;
+  }
+
+  return {
+    isActionable,
+    unitLabel,
+    contractSize,
+    lotIncrement,
+    entryRefPrice: Number(entryRefPrice.toFixed(2)),
+    stopDistance,
+    riskBudgetUsd,
+    rawPositionSize: Number(rawPositionSize.toFixed(4)),
+    suggestedSize,
+    notionalExposureUsd,
+    projectedStopLossPnl,
+    projectedTarget1Pnl,
+    projectedTarget2Pnl,
+    projectedTarget3Pnl,
+    stopLossReturnPct: toPct(projectedStopLossPnl),
+    target1ReturnPct: toPct(projectedTarget1Pnl),
+    target2ReturnPct: toPct(projectedTarget2Pnl),
+    target3ReturnPct: toPct(projectedTarget3Pnl),
+    belowMinIncrement,
+    exceedsInstitutionalRiskLimit,
+    warningMessage,
+  };
+}
+
 

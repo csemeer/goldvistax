@@ -29,11 +29,20 @@ import {
   Scale,
   Gauge,
   Clock,
+  BookOpen,
+  ArrowRightLeft,
 } from 'lucide-react';
 import {
   runWalkForwardOptimization,
   runMonteCarloPermutation,
   calculateSessionSlippage,
+  buildInstitutionalL2OrderBook,
+  simulateBacktestL2Execution,
+  L2ExecutionMode,
+  L2FeeTier,
+  L2LiquiditySession,
+  L2ExecutionSimulatorReport,
+  L2OrderBookSnapshot,
 } from '../services/advancedBacktestingEngine';
 
 interface BacktestingWorkspaceProps {
@@ -57,7 +66,7 @@ export const BacktestingWorkspace: React.FC<BacktestingWorkspaceProps> = ({
   currentMid = 3950.00,
   instrumentId = 'XAUUSD',
 }) => {
-  const [activeTab, setActiveTab] = useState<'overview' | 'walkForward' | 'monteCarlo' | 'sessionSlippage'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'executionSimulator' | 'walkForward' | 'monteCarlo' | 'sessionSlippage'>('overview');
   const [selectedStrategyId, setSelectedStrategyId] = useState<string>(
     initialStrategyId || strategies[0]?.id || 'STRAT-01-MACRO-TREND'
   );
@@ -114,6 +123,119 @@ export const BacktestingWorkspace: React.FC<BacktestingWorkspaceProps> = ({
     () => calculateSessionSlippage(simulatedUtcHour, simulatedHighImpact),
     [simulatedUtcHour, simulatedHighImpact]
   );
+
+  // Institutional L2 Backtest Execution Simulator State
+  const [simExecutionMode, setSimExecutionMode] = useState<L2ExecutionMode>('MARKET_SWEEP');
+  const [simFeeTier, setSimFeeTier] = useState<L2FeeTier>('ECN_PRO');
+  const [simSessionRegime, setSimSessionRegime] = useState<L2LiquiditySession>('LONDON_NY_OVERLAP');
+  const [simLotOverride, setSimLotOverride] = useState<string>('');
+  const [simDepthMultiplier, setSimDepthMultiplier] = useState<number>(1.0);
+  const [serverSyncPending, setServerSyncPending] = useState<boolean>(false);
+  const [serverL2Snapshot, setServerL2Snapshot] = useState<{
+    l2OrderBook: L2OrderBookSnapshot;
+    executionReport: L2ExecutionSimulatorReport;
+  } | null>(null);
+  const [appliedL2Toast, setAppliedL2Toast] = useState<boolean>(false);
+
+  const parsedSimLotOverride = useMemo(() => {
+    const val = parseFloat(simLotOverride);
+    return Number.isFinite(val) && val > 0 ? val : null;
+  }, [simLotOverride]);
+
+  const localExecutionReport = useMemo(
+    () =>
+      simulateBacktestL2Execution(backtestResult, {
+        executionMode: simExecutionMode,
+        feeTier: simFeeTier,
+        sessionRegime: simSessionRegime,
+        midPriceOverride: currentMid,
+        orderSizeOverrideLots: parsedSimLotOverride,
+        depthMultiplier: simDepthMultiplier,
+      }),
+    [
+      backtestResult,
+      simExecutionMode,
+      simFeeTier,
+      simSessionRegime,
+      currentMid,
+      parsedSimLotOverride,
+      simDepthMultiplier,
+    ]
+  );
+
+  const localL2OrderBook = useMemo(
+    () =>
+      buildInstitutionalL2OrderBook({
+        midPrice: currentMid,
+        sessionRegime: simSessionRegime,
+        depthMultiplier: simDepthMultiplier,
+        orderLotsToConsume: localExecutionReport.evaluatedLotSize,
+        consumeSide: 'BUY',
+      }),
+    [currentMid, simSessionRegime, simDepthMultiplier, localExecutionReport.evaluatedLotSize]
+  );
+
+  const executionReport = serverL2Snapshot?.executionReport ?? localExecutionReport;
+  const l2OrderBook = serverL2Snapshot?.l2OrderBook ?? localL2OrderBook;
+
+  // Clear stale server snapshot when local simulation parameters change
+  useEffect(() => {
+    setServerL2Snapshot(null);
+    setAppliedL2Toast(false);
+  }, [
+    selectedStrategyId,
+    timeframe,
+    initialCapital,
+    simExecutionMode,
+    simFeeTier,
+    simSessionRegime,
+    simLotOverride,
+    simDepthMultiplier,
+  ]);
+
+  const handleSyncServerL2Execution = async () => {
+    setServerSyncPending(true);
+    try {
+      const resp = await fetch('/api/strategies/execution-simulator', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          strategyId: selectedStrategyId,
+          timeframe,
+          initialCapital,
+          spreadPips,
+          commission,
+          executionMode: simExecutionMode,
+          feeTier: simFeeTier,
+          sessionRegime: simSessionRegime,
+          orderSizeOverrideLots: parsedSimLotOverride,
+          depthMultiplier: simDepthMultiplier,
+        }),
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data?.l2OrderBook && data?.executionReport) {
+          setServerL2Snapshot({
+            l2OrderBook: data.l2OrderBook,
+            executionReport: data.executionReport,
+          });
+        }
+      }
+    } catch {
+      // Retain deterministic local L2 engine calculation
+    } finally {
+      setServerSyncPending(false);
+    }
+  };
+
+  const handleApplyL2CostsToBacktest = () => {
+    const nextSpread = Math.max(5, Math.round(executionReport.slippagePips));
+    const nextComm = Number(executionReport.commissionPerLotRoundTurn.toFixed(2));
+    setSpreadPips(nextSpread);
+    setCommission(nextComm);
+    setAppliedL2Toast(true);
+    executeSimulation(selectedStrategyId, timeframe, initialCapital, nextSpread, nextComm, customParams);
+  };
 
   // Sync when selectedStrategyId prop changes from Strategy Lab
   useEffect(() => {
@@ -407,18 +529,33 @@ export const BacktestingWorkspace: React.FC<BacktestingWorkspaceProps> = ({
       <div className="flex flex-wrap items-center gap-2 border-b border-slate-800 pb-3">
         <button
           onClick={() => setActiveTab('overview')}
-          className={`flex items-center gap-2 px-3.5 py-2 text-xs font-semibold rounded transition-colors ${
+          className={`flex items-center gap-2 px-3.5 py-2 text-xs font-semibold rounded transition-colors whitespace-nowrap shrink-0 ${
             activeTab === 'overview'
               ? 'bg-amber-400/10 text-amber-300 border border-amber-400/30 shadow-sm'
               : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
           }`}
         >
           <Activity className="w-3.5 h-3.5" />
-          Overview & Equity Curve
+          Overview &amp; Equity Curve
+        </button>
+        <button
+          onClick={() => setActiveTab('executionSimulator')}
+          aria-label="Backtest Execution Simulator Tab"
+          className={`flex items-center gap-2 px-3.5 py-2 text-xs font-semibold rounded transition-colors whitespace-nowrap shrink-0 ${
+            activeTab === 'executionSimulator'
+              ? 'bg-amber-400/10 text-amber-300 border border-amber-400/30 shadow-sm'
+              : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
+          }`}
+        >
+          <BookOpen className="w-3.5 h-3.5 text-amber-400" />
+          Backtest Execution Simulator
+          <span className="text-[11px] font-mono tabular-nums text-amber-300/90">
+            · {executionReport.slippagePips.toFixed(1)}p
+          </span>
         </button>
         <button
           onClick={() => setActiveTab('walkForward')}
-          className={`flex items-center gap-2 px-3.5 py-2 text-xs font-semibold rounded transition-colors ${
+          className={`flex items-center gap-2 px-3.5 py-2 text-xs font-semibold rounded transition-colors whitespace-nowrap shrink-0 ${
             activeTab === 'walkForward'
               ? 'bg-amber-400/10 text-amber-300 border border-amber-400/30 shadow-sm'
               : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
@@ -432,7 +569,7 @@ export const BacktestingWorkspace: React.FC<BacktestingWorkspaceProps> = ({
         </button>
         <button
           onClick={() => setActiveTab('monteCarlo')}
-          className={`flex items-center gap-2 px-3.5 py-2 text-xs font-semibold rounded transition-colors ${
+          className={`flex items-center gap-2 px-3.5 py-2 text-xs font-semibold rounded transition-colors whitespace-nowrap shrink-0 ${
             activeTab === 'monteCarlo'
               ? 'bg-amber-400/10 text-amber-300 border border-amber-400/30 shadow-sm'
               : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
@@ -446,7 +583,7 @@ export const BacktestingWorkspace: React.FC<BacktestingWorkspaceProps> = ({
         </button>
         <button
           onClick={() => setActiveTab('sessionSlippage')}
-          className={`flex items-center gap-2 px-3.5 py-2 text-xs font-semibold rounded transition-colors ${
+          className={`flex items-center gap-2 px-3.5 py-2 text-xs font-semibold rounded transition-colors whitespace-nowrap shrink-0 ${
             activeTab === 'sessionSlippage'
               ? 'bg-amber-400/10 text-amber-300 border border-amber-400/30 shadow-sm'
               : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
@@ -682,6 +819,501 @@ export const BacktestingWorkspace: React.FC<BacktestingWorkspaceProps> = ({
       </div>
     </div>
   )}
+
+      {/* Backtest Execution Simulator (Institutional L2 Order Book Depth) Tab */}
+      {activeTab === 'executionSimulator' && (
+        <div className="space-y-6" aria-label="Backtest Execution Simulator Workspace">
+          {/* Simulator Configuration & Action Header */}
+          <div className="bg-slate-900 border border-slate-800 rounded-lg p-5">
+            <div className="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-slate-800">
+              <div>
+                <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
+                  <span className="text-amber-400 uppercase tracking-wider">
+                    Institutional L2 Order Book Depth Simulator
+                  </span>
+                  <span className="text-slate-600">·</span>
+                  <span className="text-slate-300">
+                    {executionReport.strategyId}
+                  </span>
+                  <span className="text-slate-600">·</span>
+                  <span className="text-slate-400">
+                    CME L2 · LMAX · Saxo · Currenex
+                  </span>
+                </div>
+                <h3 className="text-lg font-bold text-slate-100 mt-1">
+                  Backtest Execution Simulator — Slippage &amp; Commission Impact ({executionReport.evaluatedLotSize.toFixed(2)} Lots)
+                </h3>
+                <p className="text-xs text-slate-400 mt-1">
+                  Simulates multi-level L2 book sweeps, VWAP fill slippage, and tiered clearing/exchange commissions across {executionReport.grossTradeCount} simulated strategy executions anchored at ${l2OrderBook.midPrice.toFixed(2)}.
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2.5">
+                <button
+                  onClick={handleSyncServerL2Execution}
+                  disabled={serverSyncPending}
+                  className="flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 border border-slate-700 rounded transition-colors whitespace-nowrap shrink-0"
+                >
+                  <ArrowRightLeft className="w-3.5 h-3.5 text-amber-400" />
+                  {serverSyncPending ? 'Syncing L2...' : 'Fetch Live L2 Snapshot'}
+                </button>
+                <button
+                  onClick={handleApplyL2CostsToBacktest}
+                  className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-950 bg-amber-400 hover:bg-amber-300 rounded transition-colors whitespace-nowrap shrink-0"
+                >
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  {appliedL2Toast ? 'L2 Costs Applied' : 'Apply L2 Costs to Backtest'}
+                </button>
+              </div>
+            </div>
+
+            {/* Simulator Parameter Controls */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 mt-4 text-xs font-mono">
+              <div>
+                <label className="text-slate-400 block mb-1">Execution Algorithm</label>
+                <select
+                  aria-label="Execution Mode"
+                  value={simExecutionMode}
+                  onChange={(e) => setSimExecutionMode(e.target.value as L2ExecutionMode)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-amber-400"
+                >
+                  <option value="MARKET_SWEEP">Market Sweep (IOC Walk)</option>
+                  <option value="TWAP_SLICED">TWAP Sliced (Clip Algo)</option>
+                  <option value="LIMIT_PASSIVE">Passive Limit (Maker Rebate)</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="text-slate-400 block mb-1">Institutional Fee Tier</label>
+                <select
+                  aria-label="Institutional Fee Tier"
+                  value={simFeeTier}
+                  onChange={(e) => setSimFeeTier(e.target.value as L2FeeTier)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-amber-400"
+                >
+                  <option value="PRIME_INSTITUTIONAL">Prime Institutional ($5.00/rt)</option>
+                  <option value="ECN_PRO">ECN Pro Tier ($7.00/rt)</option>
+                  <option value="RETAIL_STANDARD">Standard Broker ($12.00/rt)</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="text-slate-400 block mb-1">L2 Liquidity Session</label>
+                <select
+                  aria-label="L2 Liquidity Session"
+                  value={simSessionRegime}
+                  onChange={(e) => setSimSessionRegime(e.target.value as L2LiquiditySession)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-amber-400"
+                >
+                  <option value="LONDON_NY_OVERLAP">London / NY Overlap (Deep)</option>
+                  <option value="NEW_YORK_AFTERNOON">NY Afternoon (Standard)</option>
+                  <option value="ASIAN_SESSION">Asian Session (Compressed)</option>
+                  <option value="EVENT_SHOCK">Macro Event Shock (Thin)</option>
+                </select>
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-slate-400">Order Size (Lots)</label>
+                  <div className="flex items-center gap-1.5 text-[10px]">
+                    <button
+                      type="button"
+                      onClick={() => setSimLotOverride('')}
+                      className={`hover:text-amber-300 ${!simLotOverride ? 'text-amber-400 font-bold' : 'text-slate-500'}`}
+                    >
+                      Auto
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSimLotOverride('10')}
+                      className={`hover:text-amber-300 ${simLotOverride === '10' ? 'text-amber-400 font-bold' : 'text-slate-500'}`}
+                    >
+                      10L
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSimLotOverride('25')}
+                      className={`hover:text-amber-300 ${simLotOverride === '25' ? 'text-amber-400 font-bold' : 'text-slate-500'}`}
+                    >
+                      25L
+                    </button>
+                  </div>
+                </div>
+                <input
+                  type="number"
+                  min="0.1"
+                  step="0.5"
+                  placeholder="Auto (Strategy Lots)"
+                  aria-label="Order Size Override Lots"
+                  value={simLotOverride}
+                  onChange={(e) => setSimLotOverride(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-amber-400"
+                />
+              </div>
+
+              <div>
+                <label className="text-slate-400 block mb-1">Book Depth Multiplier</label>
+                <select
+                  aria-label="Book Depth Multiplier"
+                  value={simDepthMultiplier}
+                  onChange={(e) => setSimDepthMultiplier(parseFloat(e.target.value))}
+                  className="w-full bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-amber-400"
+                >
+                  <option value={0.5}>0.50x Stressed Thin Book</option>
+                  <option value={1.0}>1.00x Standard Institutional</option>
+                  <option value={1.5}>1.50x High Liquidity Book</option>
+                </select>
+              </div>
+            </div>
+
+            {/* KPI Impact Strip */}
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mt-4 font-mono tabular-nums">
+              <div className="bg-slate-950 p-3 rounded border border-slate-800">
+                <span className="text-[10px] text-slate-500 uppercase block">Est. L2 Slippage</span>
+                <span className="text-lg font-bold text-amber-400 mt-0.5 block">
+                  {executionReport.slippagePips.toFixed(1)} pips
+                </span>
+                <span className="text-[10px] text-slate-400">
+                  {executionReport.slippageBps.toFixed(2)} bps · VWAP ${executionReport.vwapFillPrice.toFixed(2)}
+                </span>
+              </div>
+
+              <div className="bg-slate-950 p-3 rounded border border-slate-800">
+                <span className="text-[10px] text-slate-500 uppercase block">L2 Depth Swept</span>
+                <span className="text-lg font-bold text-slate-100 mt-0.5 block">
+                  Level {executionReport.bookDepthConsumedLevels} / {l2OrderBook.asks.length}
+                </span>
+                <span className="text-[10px] text-slate-400">
+                  {executionReport.marketImpactRatioPct.toFixed(1)}% of visible ask book
+                </span>
+              </div>
+
+              <div className="bg-slate-950 p-3 rounded border border-slate-800">
+                <span className="text-[10px] text-slate-500 uppercase block">Commission Rate</span>
+                <span className="text-lg font-bold text-slate-200 mt-0.5 block">
+                  ${executionReport.commissionPerLotRoundTurn.toFixed(2)} / lot
+                </span>
+                <span className="text-[10px] text-slate-400">
+                  ECN ${executionReport.ecnClearingFeePerLot.toFixed(2)} + Exch ${executionReport.exchangeFeePerLot.toFixed(2)} / side
+                </span>
+              </div>
+
+              <div className="bg-slate-950 p-3 rounded border border-slate-800">
+                <span className="text-[10px] text-slate-500 uppercase block">Total Friction Drag</span>
+                <span className="text-lg font-bold text-rose-400 mt-0.5 block">
+                  -${executionReport.totalExecutionDragUsd.toLocaleString()}
+                </span>
+                <span className="text-[10px] text-slate-400">
+                  Slip ${executionReport.totalSlippageCostUsd.toFixed(0)} · Comm ${executionReport.totalCommissionCostUsd.toFixed(0)}
+                </span>
+              </div>
+
+              <div className="bg-slate-950 p-3 rounded border border-slate-800">
+                <span className="text-[10px] text-slate-500 uppercase block">L2-Adjusted Net P&amp;L</span>
+                <span
+                  className={`text-lg font-bold mt-0.5 block ${
+                    executionReport.netAdjustedPnlUsd >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                  }`}
+                >
+                  {executionReport.netAdjustedPnlUsd >= 0 ? '+' : ''}${executionReport.netAdjustedPnlUsd.toLocaleString()}
+                </span>
+                <span className="text-[10px] text-slate-400">
+                  Gross: {executionReport.grossPnlUsd >= 0 ? '+' : ''}${executionReport.grossPnlUsd.toLocaleString()}
+                </span>
+              </div>
+
+              <div className="bg-slate-950 p-3 rounded border border-slate-800">
+                <span className="text-[10px] text-slate-500 uppercase block">Alpha Retention</span>
+                <span
+                  className={`text-lg font-bold mt-0.5 block ${
+                    executionReport.efficiencyRetentionPct >= 75
+                      ? 'text-emerald-400'
+                      : executionReport.efficiencyRetentionPct >= 45
+                      ? 'text-amber-400'
+                      : 'text-rose-400'
+                  }`}
+                >
+                  {executionReport.efficiencyRetentionPct.toFixed(1)}%
+                </span>
+                <span className="text-[10px] text-slate-400">
+                  Adj PF {executionReport.adjustedProfitFactor.toFixed(2)} · Win {executionReport.adjustedWinRatePct.toFixed(1)}%
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* L2 Depth Ladder + Cost Attribution Split */}
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+            {/* Institutional L2 Order Book Ladder */}
+            <div className="lg:col-span-7 bg-slate-900 border border-slate-800 rounded-lg p-5">
+              <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-800 mb-3">
+                <div>
+                  <h4 className="text-sm font-semibold text-slate-100">
+                    Institutional Level-2 Order Book Depth Ladder
+                  </h4>
+                  <p className="text-xs text-slate-400">
+                    Ask &amp; Bid depth across prime venues · Highlighted rows indicate L2 levels swept by {executionReport.evaluatedLotSize.toFixed(2)}-lot execution.
+                  </p>
+                </div>
+                <span className="text-xs font-mono tabular-nums text-slate-300">
+                  Bid/Ask Ratio: <strong className="text-amber-400">{l2OrderBook.imbalanceRatio.toFixed(2)}x</strong>
+                </span>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs font-mono tabular-nums">
+                  <thead className="bg-slate-950 text-slate-400 uppercase text-[10px] border-b border-slate-800">
+                    <tr>
+                      <th className="px-2.5 py-2 text-left">Level</th>
+                      <th className="px-2.5 py-2 text-right">Price ($)</th>
+                      <th className="px-2.5 py-2 text-left">Depth Distribution</th>
+                      <th className="px-2.5 py-2 text-right">Size (Lots)</th>
+                      <th className="px-2.5 py-2 text-right">Cum. Lots</th>
+                      <th className="px-2.5 py-2 text-right">Swept</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60">
+                    {[...l2OrderBook.asks].reverse().map((lvl) => {
+                      const maxLvl = Math.max(1, ...l2OrderBook.asks.map((a) => a.sizeLots), ...l2OrderBook.bids.map((b) => b.sizeLots));
+                      const depthPct = Math.min(100, (lvl.sizeLots / maxLvl) * 100);
+                      const sweptPct = lvl.sizeLots > 0 ? Math.min(100, (lvl.consumedLots / lvl.sizeLots) * 100) : 0;
+                      return (
+                        <tr
+                          key={`ASK-${lvl.level}`}
+                          className={lvl.isConsumedByOrder ? 'bg-amber-500/10' : 'hover:bg-slate-800/30'}
+                        >
+                          <td className="px-2.5 py-1.5 text-rose-400 font-semibold">ASK L{lvl.level}</td>
+                          <td className="px-2.5 py-1.5 text-right text-rose-300">${lvl.price.toFixed(2)}</td>
+                          <td className="px-2.5 py-1.5 w-36">
+                            <div className="w-full h-2.5 bg-slate-950 rounded-sm overflow-hidden relative border border-slate-800">
+                              <div
+                                className="h-full bg-rose-500/35"
+                                style={{ width: `${depthPct.toFixed(1)}%` }}
+                              />
+                              {lvl.consumedLots > 0 && (
+                                <div
+                                  className="h-full bg-amber-400 absolute top-0 left-0"
+                                  style={{ width: `${((depthPct * sweptPct) / 100).toFixed(1)}%` }}
+                                />
+                              )}
+                            </div>
+                          </td>
+                          <td className="px-2.5 py-1.5 text-right text-slate-200">{lvl.sizeLots.toFixed(1)}</td>
+                          <td className="px-2.5 py-1.5 text-right text-slate-400">{lvl.cumulativeLots.toFixed(1)}</td>
+                          <td className="px-2.5 py-1.5 text-right font-semibold text-amber-300">
+                            {lvl.consumedLots > 0 ? `${lvl.consumedLots.toFixed(1)}L` : '—'}
+                          </td>
+                        </tr>
+                      );
+                    })}
+
+                    {/* Top-of-Book Spread & VWAP Mid Strip */}
+                    <tr className="bg-slate-950 border-y border-slate-700">
+                      <td colSpan={6} className="px-3 py-2 text-center text-[11px] text-slate-300">
+                        Best Bid <strong className="text-emerald-400">${l2OrderBook.bestBid.toFixed(2)}</strong>
+                        <span className="text-slate-600 mx-2">·</span>
+                        Top Spread <strong className="text-amber-300">{l2OrderBook.topOfBookSpreadPips} pips</strong>
+                        <span className="text-slate-600 mx-2">·</span>
+                        Best Ask <strong className="text-rose-400">${l2OrderBook.bestAsk.toFixed(2)}</strong>
+                        <span className="text-slate-600 mx-2">·</span>
+                        Est. VWAP <strong className="text-slate-100">${executionReport.vwapFillPrice.toFixed(2)}</strong>
+                      </td>
+                    </tr>
+
+                    {l2OrderBook.bids.map((lvl) => {
+                      const maxLvl = Math.max(1, ...l2OrderBook.asks.map((a) => a.sizeLots), ...l2OrderBook.bids.map((b) => b.sizeLots));
+                      const depthPct = Math.min(100, (lvl.sizeLots / maxLvl) * 100);
+                      return (
+                        <tr key={`BID-${lvl.level}`} className="hover:bg-slate-800/30">
+                          <td className="px-2.5 py-1.5 text-emerald-400 font-semibold">BID L{lvl.level}</td>
+                          <td className="px-2.5 py-1.5 text-right text-emerald-300">${lvl.price.toFixed(2)}</td>
+                          <td className="px-2.5 py-1.5 w-36">
+                            <div className="w-full h-2.5 bg-slate-950 rounded-sm overflow-hidden border border-slate-800">
+                              <div
+                                className="h-full bg-emerald-500/40"
+                                style={{ width: `${depthPct.toFixed(1)}%` }}
+                              />
+                            </div>
+                          </td>
+                          <td className="px-2.5 py-1.5 text-right text-slate-200">{lvl.sizeLots.toFixed(1)}</td>
+                          <td className="px-2.5 py-1.5 text-right text-slate-400">{lvl.cumulativeLots.toFixed(1)}</td>
+                          <td className="px-2.5 py-1.5 text-right text-slate-500">—</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Cost Attribution & Gross-to-Net Waterfall Breakdown */}
+            <div className="lg:col-span-5 space-y-5">
+              <div className="bg-slate-900 border border-slate-800 rounded-lg p-5">
+                <h4 className="text-sm font-semibold text-slate-100 mb-1">
+                  Execution Drag Attribution Breakdown
+                </h4>
+                <p className="text-xs text-slate-400 mb-4">
+                  Decomposes L2 order-book sweep slippage vs. prime clearing and exchange fees over {executionReport.totalLotsTraded.toFixed(1)} total lots traded.
+                </p>
+
+                <div className="space-y-3 text-xs font-mono tabular-nums">
+                  <div className="flex items-center justify-between py-1.5 border-b border-slate-800">
+                    <span className="text-slate-400">Gross Price P&amp;L (Zero Friction)</span>
+                    <span className={`font-bold ${executionReport.grossPnlUsd >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {executionReport.grossPnlUsd >= 0 ? '+' : ''}${executionReport.grossPnlUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </span>
+                  </div>
+
+                  <div className="flex items-center justify-between py-1.5 border-b border-slate-800">
+                    <span className="text-slate-400">L2 Spread + Market Impact Slippage</span>
+                    <span className="text-amber-400 font-semibold">
+                      -${executionReport.totalSlippageCostUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </span>
+                  </div>
+
+                  <div className="flex items-center justify-between py-1.5 border-b border-slate-800">
+                    <span className="text-slate-400">ECN Clearing Fee ({simFeeTier.replace(/_/g, ' ')})</span>
+                    <span className="text-rose-300">
+                      -${executionReport.feeBreakdown.clearingFeeUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </span>
+                  </div>
+
+                  <div className="flex items-center justify-between py-1.5 border-b border-slate-800">
+                    <span className="text-slate-400">COMEX / Venue Exchange Fee</span>
+                    <span className="text-rose-300">
+                      -${executionReport.feeBreakdown.exchangeFeeUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </span>
+                  </div>
+
+                  {executionReport.feeBreakdown.passiveRebateUsd > 0 && (
+                    <div className="flex items-center justify-between py-1.5 border-b border-slate-800">
+                      <span className="text-emerald-400">Passive Limit Maker Rebate</span>
+                      <span className="text-emerald-400 font-semibold">
+                        +${executionReport.feeBreakdown.passiveRebateUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </span>
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-between pt-2 text-sm">
+                    <span className="text-slate-200 font-bold">L2-Adjusted Net P&amp;L</span>
+                    <span className={`font-bold ${executionReport.netAdjustedPnlUsd >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {executionReport.netAdjustedPnlUsd >= 0 ? '+' : ''}${executionReport.netAdjustedPnlUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Proportional Bar: Slippage vs Commission */}
+                <div className="mt-4 pt-3 border-t border-slate-800">
+                  <div className="flex items-center justify-between text-[11px] font-mono text-slate-400 mb-1.5">
+                    <span>Friction Mix</span>
+                    <span>
+                      {executionReport.totalExecutionDragUsd > 0
+                        ? `${((executionReport.totalSlippageCostUsd / executionReport.totalExecutionDragUsd) * 100).toFixed(0)}% Slippage · ${((executionReport.totalCommissionCostUsd / executionReport.totalExecutionDragUsd) * 100).toFixed(0)}% Commission`
+                        : '0% Drag'}
+                    </span>
+                  </div>
+                  <div className="w-full h-2.5 bg-slate-950 rounded overflow-hidden flex border border-slate-800">
+                    {executionReport.totalExecutionDragUsd > 0 && (
+                      <>
+                        <div
+                          className="h-full bg-amber-400"
+                          style={{
+                            width: `${((executionReport.totalSlippageCostUsd / executionReport.totalExecutionDragUsd) * 100).toFixed(1)}%`,
+                          }}
+                        />
+                        <div
+                          className="h-full bg-rose-400"
+                          style={{
+                            width: `${((executionReport.totalCommissionCostUsd / executionReport.totalExecutionDragUsd) * 100).toFixed(1)}%`,
+                          }}
+                        />
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Execution Algo Guidance */}
+              <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 text-xs space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="font-mono uppercase text-amber-400 font-semibold flex items-center gap-1.5">
+                    <Scale className="w-3.5 h-3.5" /> Institutional Execution Advisory
+                  </span>
+                  <span className="font-mono text-slate-300 font-bold">
+                    Optimal: {executionReport.recommendedExecutionMode.replace(/_/g, ' ')}
+                  </span>
+                </div>
+                <p className="text-slate-400 leading-relaxed">
+                  {executionReport.bookDepthConsumedLevels > 2
+                    ? `Sweeping ${executionReport.evaluatedLotSize.toFixed(1)} lots crosses ${executionReport.bookDepthConsumedLevels} L2 price levels (+${executionReport.marketImpactPips.toFixed(1)} pips market impact). Switching to TWAP Sliced clips preserves liquidity replenishment and trims slippage drag.`
+                    : `At ${executionReport.evaluatedLotSize.toFixed(1)} lots, tickets clear within Level ${executionReport.bookDepthConsumedLevels} of top-of-book depth (${l2OrderBook.totalAskDepthLots.toFixed(0)} lots visible Ask depth). Passive Limit posting further recovers half-spread crossing costs.`}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Per-Trade L2 Execution Cost Impact Ledger */}
+          <div className="bg-slate-900 border border-slate-800 rounded-lg overflow-hidden">
+            <div className="px-5 py-4 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h4 className="text-sm font-semibold text-slate-100">
+                  Per-Trade L2 Execution &amp; Commission Audit ({executionReport.tradeExecutionImpacts.length} Trades)
+                </h4>
+                <p className="text-xs text-slate-400">
+                  Trade-by-trade breakdown of VWAP L2 entry fills, depth levels consumed, commissions, and adjusted net return.
+                </p>
+              </div>
+              <span className="text-xs font-mono text-slate-400">
+                Avg Drag / Trade:{' '}
+                <strong className="text-rose-400">
+                  -${(executionReport.slippageDollarsPerTrade + executionReport.commissionDollarsPerTrade).toFixed(2)}
+                </strong>
+              </span>
+            </div>
+
+            <div className="overflow-x-auto max-h-72 overflow-y-auto">
+              <table className="w-full text-xs text-left font-mono tabular-nums">
+                <thead className="bg-slate-950 text-slate-400 uppercase text-[10px] sticky top-0 border-b border-slate-800">
+                  <tr>
+                    <th className="px-4 py-2.5">Trade</th>
+                    <th className="px-4 py-2.5">Side</th>
+                    <th className="px-4 py-2.5 text-right">Lots</th>
+                    <th className="px-4 py-2.5 text-right">Entry ($)</th>
+                    <th className="px-4 py-2.5 text-right">L2 VWAP ($)</th>
+                    <th className="px-4 py-2.5 text-right">Levels</th>
+                    <th className="px-4 py-2.5 text-right">Slippage</th>
+                    <th className="px-4 py-2.5 text-right">Comm ($)</th>
+                    <th className="px-4 py-2.5 text-right">Gross P&amp;L</th>
+                    <th className="px-4 py-2.5 text-right">L2 Net P&amp;L</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/60">
+                  {executionReport.tradeExecutionImpacts.map((tr) => (
+                    <tr key={tr.tradeId} className="hover:bg-slate-800/30">
+                      <td className="px-4 py-2 text-slate-300 font-bold">{tr.tradeId}</td>
+                      <td className="px-4 py-2 text-slate-300">{tr.direction}</td>
+                      <td className="px-4 py-2 text-right text-slate-200">{tr.lots.toFixed(2)}</td>
+                      <td className="px-4 py-2 text-right text-slate-400">${tr.entryPrice.toFixed(2)}</td>
+                      <td className="px-4 py-2 text-right text-amber-300">${tr.vwapEntryPrice.toFixed(2)}</td>
+                      <td className="px-4 py-2 text-right text-slate-300">L{tr.levelsSwept}</td>
+                      <td className="px-4 py-2 text-right text-amber-400">
+                        {tr.slippagePips.toFixed(1)}p (-${tr.slippageCostUsd.toFixed(2)})
+                      </td>
+                      <td className="px-4 py-2 text-right text-rose-300">-${tr.commissionCostUsd.toFixed(2)}</td>
+                      <td className={`px-4 py-2 text-right ${tr.grossTradePnlUsd >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        {tr.grossTradePnlUsd >= 0 ? '+' : ''}${tr.grossTradePnlUsd.toFixed(2)}
+                      </td>
+                      <td className={`px-4 py-2 text-right font-bold ${tr.l2AdjustedNetPnlUsd >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        {tr.l2AdjustedNetPnlUsd >= 0 ? '+' : ''}${tr.l2AdjustedNetPnlUsd.toFixed(2)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Walk-Forward k-Fold Optimization Tab */}
       {activeTab === 'walkForward' && (

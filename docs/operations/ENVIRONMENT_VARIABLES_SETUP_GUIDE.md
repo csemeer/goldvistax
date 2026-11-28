@@ -8,14 +8,14 @@
 
 ## 1. Overview & Configuration Rules
 
-Aurum Intelligence / GOLDVISTA loads environment variables at startup via `dotenv.config()` (`server.ts`) and reads `process.env` across the Express API gateway, security middleware, macro engines, and persistence adapters.
+Aurum Intelligence / GOLDVISTA loads environment variables at module initialization via `import 'dotenv/config'` (`server.ts`) and reads `process.env` across the Express API gateway, security middleware, macro engines, and persistence adapters.
 
 ### Critical Operational Rules
-1. **Never commit `.env` or real secrets to Git:** Only `.env.example` belongs in source control. Store production secrets in your hosting platform's secret manager (e.g., Google Cloud Secret Manager, Cloud Run environment variables, AI Studio Secrets panel, or AWS Secrets Manager).
-2. **Active `process.env` vs. Runtime Workspace Configuration:**
-   - **17 of the 22 listed variables** (plus platform variables such as `GEMINI_API_KEY`, `PORT`, `NODE_ENV`, `APP_URL`, `AURUM_FORECAST_STORE_PATH`, `AURUM_VERBOSE_LOGS`, `STRICT_FRAME_OPTIONS`, `CSP_FRAME_ANCESTORS`) are read directly from `process.env` at boot or request time.
-   - **5 of the listed variables** (`MARKET_DATA_PRIMARY_PROVIDER`, `MARKET_DATA_FALLBACK_PROVIDER`, `MARKET_DATA_MAX_STALE_SECONDS`, `MARKET_DATA_POLL_INTERVAL_SECONDS`, `WEBHOOK_URL`, along with `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`) exist in `.env.example` as standard configuration keys, while the current server initializes safe defaults (`yahoo_finance`, `simulated_reference`, `60`, `15`, and alerts disabled) and applies live updates via the **Market Data Config** / **Notification Settings** UI workspaces or `POST /api/market-data/config` and `POST /api/notifications/config` (`PRO` role required). Both methods are documented below.
-3. **Top-Level Store Path Timing (`*_STORE_PATH`):** In `server.ts`, `AURUM_BILLING_STORE_PATH`, `AURUM_FORECAST_STORE_PATH`, and `AURUM_JOURNAL_STORE_PATH` are read at module initialization before `dotenv.config()` executes. In production containers/Cloud Run, environment variables are already injected into the process before Node starts. For local development, if you override these three paths in `.env`, export them in your shell or run with `npx tsx --env-file=.env server.ts` so they take effect before module imports resolve.
+1. **Never commit `.env` or real secrets to Git:** Only `.env.example` belongs in source control (`.env*` is gitignored). Store production secrets in your hosting platform's secret manager (e.g., Google Cloud Secret Manager, Cloud Run environment variables, AI Studio Secrets panel, or AWS Secrets Manager).
+2. **Startup Hydration & Runtime Workspace Configuration:**
+   - All **22 listed variables** (plus companion platform variables) are read from `process.env` at startup or request time (`buildEnvHydrationConfigs` in `serverSecurity.ts` automatically hydrates `MARKET_DATA_*`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `WEBHOOK_URL` on boot while ignoring unreplaced template placeholders).
+   - In addition, `PRO`/`ALPHA` users can inspect or override Market Data and Notification settings live without restarting via the **Market Data Config** / **Notification Settings** UI workspaces (`POST /api/market-data/config` and `POST /api/notifications/config`).
+3. **Top-Level Store Path Timing (`*_STORE_PATH`):** `server.ts` imports `dotenv/config` as its first statement so `AURUM_BILLING_STORE_PATH`, `AURUM_FORECAST_STORE_PATH`, `AURUM_JOURNAL_STORE_PATH`, and `AURUM_SESSION_SECRET` resolve from `.env` before server services initialize.
 
 ---
 
@@ -23,11 +23,11 @@ Aurum Intelligence / GOLDVISTA loads environment variables at startup via `doten
 
 | Variable | Category | Required In Prod | Default / Fallback | Enforcement Mode | Core Relevance |
 | --- | --- | --- | --- | --- | --- |
-| `MARKET_DATA_PRIMARY_PROVIDER` | Market Data | Recommended | `yahoo_finance` | `.env.example` + `/api/market-data/config` | Selects primary real-time/delayed price source |
-| `MARKET_DATA_FALLBACK_PROVIDER` | Market Data | Recommended | `simulated_reference` | `.env.example` + `/api/market-data/config` | Controls failover source when primary fails |
-| `MARKET_DATA_MAX_STALE_SECONDS` | Market Data | Yes | `60` | `.env.example` + `/api/market-data/config` | Enforces freshness gate (`QUALITY_HOLD` abstention) |
-| `MARKET_DATA_POLL_INTERVAL_SECONDS` | Market Data | Recommended | `15` | `.env.example` + `/api/market-data/config` | Sets UI/router quote polling cadence |
-| `WEBHOOK_URL` | Alerting | Optional | `""` (disabled) | `.env.example` + `/api/notifications/config` | Sends alert embeds/JSON webhooks to Discord/Slack/Ops |
+| `MARKET_DATA_PRIMARY_PROVIDER` | Market Data | Recommended | `yahoo_finance` | Boot `process.env` + `/api/market-data/config` | Selects primary real-time/delayed price source |
+| `MARKET_DATA_FALLBACK_PROVIDER` | Market Data | Recommended | `simulated_reference` | Boot `process.env` + `/api/market-data/config` | Controls failover source when primary fails |
+| `MARKET_DATA_MAX_STALE_SECONDS` | Market Data | Yes | `60` | Boot `process.env` + `/api/market-data/config` | Enforces freshness gate (`QUALITY_HOLD` abstention) |
+| `MARKET_DATA_POLL_INTERVAL_SECONDS` | Market Data | Recommended | `15` | Boot `process.env` + `/api/market-data/config` | Sets UI/router quote polling cadence |
+| `WEBHOOK_URL` | Alerting | Optional | `""` (disabled) | Boot `process.env` + `/api/notifications/config` | Sends alert embeds/JSON webhooks to Discord/Slack/Ops |
 | `STRIPE_WEBHOOK_SECRET` | Billing Security | **Yes** | Unset (sandbox bypass in dev only) | Active `process.env` | Verifies Stripe HMAC-SHA256 webhook signatures |
 | `AURUM_BILLING_STORE_PATH` | Billing Storage | Only if not using Postgres | `/tmp/aurum-billing-store.json` | Active `process.env` (top-level) | Atomic JSON store path for billing & credit ledger |
 | `EIA_API_KEY` | Macro Data | Optional (Recommended) | Curated baseline fallback | Active `process.env` | Live US EIA petroleum inventory & balance feeds |
@@ -58,7 +58,7 @@ Aurum Intelligence / GOLDVISTA loads environment variables at startup via `doten
 | `AURUM_VERBOSE_LOGS` | `false` | Set `true` to emit `INFO` structured JSON logs in addition to `WARN`/`ERROR` |
 | `STRICT_FRAME_OPTIONS` | `false` | Set `true` to emit `X-Frame-Options: SAMEORIGIN` (keep unset inside AI Studio iframe) |
 | `CSP_FRAME_ANCESTORS` | `'self' https://aistudio.google.com ...` | Overrides allowed iframe embedding origins in `Content-Security-Policy` |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | `""` | Telegram Bot credentials configured in `.env.example` & Notification Settings UI |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | `""` | Telegram Bot credentials hydrated at boot & editable in Notification Settings UI |
 
 ---
 

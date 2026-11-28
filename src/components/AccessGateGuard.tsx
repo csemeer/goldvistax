@@ -30,6 +30,7 @@ interface AccessGateGuardProps {
     description: string;
   }) => void;
   onSwitchPersona: (role: UserRole) => void;
+  onChangeTier?: (role: Exclude<UserRole, 'GUEST'>) => void;
 }
 
 export const AccessGateGuard: React.FC<AccessGateGuardProps> = ({
@@ -38,6 +39,7 @@ export const AccessGateGuard: React.FC<AccessGateGuardProps> = ({
   onOpenPricingHub,
   onOpenCheckout,
   onSwitchPersona,
+  onChangeTier,
 }) => {
   const isAlphaRequired = accessCheck.requiredRole === 'ALPHA';
   const isProRequired = accessCheck.requiredRole === 'PRO';
@@ -106,15 +108,17 @@ export const AccessGateGuard: React.FC<AccessGateGuardProps> = ({
           {isGuest ? (
             <>
               <button
+                type="button"
                 onClick={() => onOpenAuth('ENROLL')}
-                className="flex-1 min-w-[200px] flex items-center justify-center gap-2 py-3 px-5 bg-gradient-to-r from-amber-500 to-amber-400 hover:from-amber-400 hover:to-amber-300 text-slate-950 font-bold rounded-lg text-xs shadow-md transition-all cursor-pointer"
+                className="flex-1 min-w-[200px] min-h-[44px] flex items-center justify-center gap-2 py-3 px-5 bg-gradient-to-r from-amber-500 to-amber-400 hover:from-amber-400 hover:to-amber-300 text-slate-950 font-bold rounded-lg text-xs shadow-md transition-all cursor-pointer"
               >
                 <Zap className="w-4 h-4 fill-slate-950" />
-                <span>Enroll Free (5 Welcome Credits)</span>
+                <span>Sign Up Free (5 Welcome Credits)</span>
               </button>
               <button
+                type="button"
                 onClick={() => onOpenAuth('LOGIN')}
-                className="px-4 py-3 bg-slate-800 hover:bg-slate-750 text-slate-200 font-medium text-xs rounded-lg transition-colors border border-slate-700"
+                className="min-h-[44px] px-5 py-3 bg-slate-800 hover:bg-slate-700 text-slate-100 font-medium text-xs rounded-lg transition-colors border border-slate-700 cursor-pointer"
               >
                 Sign In
               </button>
@@ -165,14 +169,29 @@ export const AccessGateGuard: React.FC<AccessGateGuardProps> = ({
             </>
           )}
 
-          {/* Quick Persona Switcher for Immediate Inspection / Testing */}
+          {/* Quick Tier Preview (Preserves Current Identity) or Demo Preview (Guest) */}
           <button
-            onClick={() => onSwitchPersona(accessCheck.requiredRole)}
-            className="w-full sm:w-auto px-4 py-2.5 bg-slate-950 hover:bg-slate-800 text-slate-400 hover:text-amber-400 border border-slate-800 hover:border-amber-400/40 rounded-lg text-xs font-mono transition-colors flex items-center justify-center gap-1.5"
-            title="Instant Preview Demo Switcher"
+            type="button"
+            onClick={() => {
+              if (!isGuest && onChangeTier && accessCheck.requiredRole !== 'GUEST') {
+                onChangeTier(accessCheck.requiredRole);
+              } else {
+                onSwitchPersona(accessCheck.requiredRole);
+              }
+            }}
+            className="w-full sm:w-auto px-4 py-2.5 bg-slate-950 hover:bg-slate-800 text-slate-300 hover:text-amber-300 border border-slate-800 hover:border-amber-400/40 rounded-lg text-xs font-mono transition-colors flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
+            title={
+              !isGuest && onChangeTier
+                ? 'Unlock this tier on your current signed-in account without losing your trades'
+                : 'Load sandbox demo persona for immediate feature preview'
+            }
           >
-            <UserCheck className="w-3.5 h-3.5 text-amber-400" />
-            <span>⚡ Switch Persona to {accessCheck.requiredRole} (Test Mode)</span>
+            <UserCheck className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+            <span>
+              {!isGuest && onChangeTier
+                ? `Activate ${accessCheck.requiredRole} Tier (Keep My Account)`
+                : `Preview ${accessCheck.requiredRole} Demo Account`}
+            </span>
           </button>
         </div>
       </div>

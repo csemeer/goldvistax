@@ -5,8 +5,14 @@
  * 11 specialist agents, evidence citations, adversarial challenge critiques, and Gemini synthesis console.
  */
 
-import React, { useState } from 'react';
-import { AgentAssessment, EvidenceItem, SpecialistAgentRole } from '../domain/types';
+import React, { useMemo, useState } from 'react';
+import { AgentAssessment, Candle, CommodityType, EvidenceItem, InstrumentId, Quote, SpecialistAgentRole, Timeframe } from '../domain/types';
+import { getLiveQuotes } from '../services/marketData';
+import { TradeCorrelationMatrixPanel } from './TradeCorrelationMatrixPanel';
+import { RollingCorrelationD3Panel } from './RollingCorrelationD3Panel';
+import { QeCycleOverlayPanel } from './QeCycleOverlayPanel';
+import { InstitutionalSentimentGauge } from './InstitutionalSentimentGauge';
+import { InstitutionalQueuePanel } from './InstitutionalQueuePanel';
 import {
   Brain,
   ShieldAlert,
@@ -30,12 +36,21 @@ import { getSessionBearerToken } from '../services/authService';
 interface CouncilWorkspaceProps {
   agents: AgentAssessment[];
   evidence: EvidenceItem[];
+  quotes?: Partial<Record<InstrumentId, Quote>>;
+  candles?: Candle[];
+  currentCommodity?: CommodityType;
+  timeframe?: Timeframe;
 }
 
 export const CouncilWorkspace: React.FC<CouncilWorkspaceProps> = ({
   agents,
   evidence,
+  quotes,
+  candles = [],
+  currentCommodity = 'GOLD',
+  timeframe = '1D',
 }) => {
+  const effectiveQuotes = useMemo(() => quotes || getLiveQuotes(), [quotes]);
   const [selectedRole, setSelectedRole] = useState<SpecialistAgentRole>('ADVISORY_COUNCIL');
   const [userPrompt, setUserPrompt] = useState<string>('');
   const [isLoading, setIsLoading] = useState<boolean>(false);
@@ -241,6 +256,34 @@ export const CouncilWorkspace: React.FC<CouncilWorkspaceProps> = ({
           )}
         </div>
       )}
+
+      {/* Trade Correlation Matrix Panel (XAU/USD, DXY, 10Y Treasury Yields) */}
+      <TradeCorrelationMatrixPanel
+        quotes={effectiveQuotes}
+        candles={currentCommodity === 'GOLD' && timeframe === '1D' ? candles : []}
+      />
+
+      {/* D3.js Rolling 30-Day Correlation Scatter Plot & Heat Map (Risk-Off Divergence) */}
+      <RollingCorrelationD3Panel
+        quotes={effectiveQuotes}
+        candles={currentCommodity === 'GOLD' && timeframe === '1D' ? candles : []}
+      />
+
+      {/* D3.js Historical QE Liquidity Cycle Overlay (XAU/USD) */}
+      <QeCycleOverlayPanel
+        quotes={effectiveQuotes}
+        candles={currentCommodity === 'GOLD' ? candles : []}
+      />
+
+      {/* D3.js CFTC COT Gold Institutional Sentiment Gauge */}
+      <InstitutionalSentimentGauge />
+
+      {/* D3.js Aggregated Broker Pending Orders at Support/Resistance Zones */}
+      <InstitutionalQueuePanel
+        quotes={effectiveQuotes}
+        candles={candles}
+        currentCommodity={currentCommodity}
+      />
 
       {/* Specialist Agents Grid & Detail Inspector */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">

@@ -7,11 +7,10 @@
 
 import React, { useState } from 'react';
 import { Quote } from '../domain/types';
+import { UserSession, isValidEmailAddress } from '../services/authService';
 import {
   ShieldCheck,
   Zap,
-  TrendingUp,
-  Activity,
   ArrowRight,
   Lock,
   RotateCcw,
@@ -19,23 +18,21 @@ import {
   Brain,
   Building2,
   CheckCircle2,
-  DollarSign,
-  ChevronRight,
   CandlestickChart,
-  Sliders,
-  Users,
-  Compass,
-  Mail,
   User,
-  Globe,
-  Award,
-  Layers,
+  LogOut,
+  UserPlus,
+  Eye,
+  EyeOff,
+  AlertCircle,
 } from 'lucide-react';
 
 interface LandingPageProps {
   quotes: Record<string, Quote>;
+  userSession?: UserSession;
   onLaunchTerminal: () => void;
   onOpenAuth: (mode?: 'LOGIN' | 'ENROLL') => void;
+  onLogout?: () => void;
   onOpenCheckout: (item: {
     type: 'PACK' | 'TIER';
     id: string;
@@ -47,6 +44,7 @@ interface LandingPageProps {
   onEnrollUser?: (data: {
     email: string;
     displayName: string;
+    password?: string;
     country: string;
     tradingProfile: {
       primaryHorizon: 'INTRADAY' | 'SWING' | 'PROP_FIRM' | 'MACRO';
@@ -54,28 +52,35 @@ interface LandingPageProps {
       accountSize: string;
       experienceLevel: 'NOVICE' | 'INTERMEDIATE' | 'ADVANCED' | 'INSTITUTIONAL';
     };
-  }) => void;
+  }) => Promise<void> | void;
 }
 
 export const LandingPage: React.FC<LandingPageProps> = ({
   quotes,
+  userSession,
   onLaunchTerminal,
   onOpenAuth,
+  onLogout,
   onOpenCheckout,
   onEnrollUser,
 }) => {
   const [activeTab, setActiveTab] = useState<'SWING' | 'INTRADAY' | 'PROP_FIRM'>('SWING');
   const [roiLots, setRoiLots] = useState<number>(6);
 
-  // Embedded User Details Collector State
+  // Embedded User Sign-Up Form State
   const [enrollName, setEnrollName] = useState<string>('');
   const [enrollEmail, setEnrollEmail] = useState<string>('');
+  const [enrollPassword, setEnrollPassword] = useState<string>('');
+  const [showEnrollPassword, setShowEnrollPassword] = useState<boolean>(false);
   const [enrollCountry, setEnrollCountry] = useState<string>('United States');
   const [enrollHorizon, setEnrollHorizon] = useState<'INTRADAY' | 'SWING' | 'PROP_FIRM' | 'MACRO'>('SWING');
   const [enrollBroker, setEnrollBroker] = useState<string>('ic_markets');
   const [enrollAccountSize, setEnrollAccountSize] = useState<string>('$50,000 - $100,000');
-  const [enrollExperience, setEnrollExperience] = useState<'NOVICE' | 'INTERMEDIATE' | 'ADVANCED' | 'INSTITUTIONAL'>('ADVANCED');
+  const [enrollExperience] = useState<'NOVICE' | 'INTERMEDIATE' | 'ADVANCED' | 'INSTITUTIONAL'>('ADVANCED');
+  const [enrollError, setEnrollError] = useState<string | null>(null);
   const [isSubmittingEnroll, setIsSubmittingEnroll] = useState<boolean>(false);
+
+  const isAuthenticated = Boolean(userSession && userSession.role !== 'GUEST');
 
   const goldQuote = quotes['XAUUSD'] || {
     mid: 4048.5,
@@ -95,46 +100,66 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   const totalValueDelivered = slippageSaved + commissionRebated + badTradeAvoidance;
   const netRoiRatio = (totalValueDelivered / 49).toFixed(1);
 
-  const handleEmbeddedSubmit = (e: React.FormEvent) => {
+  const handleEmbeddedSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!enrollEmail || !enrollEmail.includes('@')) return;
+    setEnrollError(null);
+
+    if (enrollName.trim().length < 2) {
+      setEnrollError('Please enter your full name or trader handle.');
+      return;
+    }
+    if (!isValidEmailAddress(enrollEmail)) {
+      setEnrollError('Please enter a valid email address.');
+      return;
+    }
+    if (enrollPassword.length < 8) {
+      setEnrollError('Please create a password of at least 8 characters.');
+      return;
+    }
 
     setIsSubmittingEnroll(true);
-    if (onEnrollUser) {
-      onEnrollUser({
-        email: enrollEmail,
-        displayName: enrollName || enrollEmail.split('@')[0],
-        country: enrollCountry,
-        tradingProfile: {
-          primaryHorizon: enrollHorizon,
-          brokerName:
-            enrollBroker === 'ic_markets'
-              ? 'IC Markets Global (Raw ECN)'
-              : enrollBroker === 'pepperstone'
-              ? 'Pepperstone Razor'
-              : enrollBroker === 'tickmill'
-              ? 'Tickmill Pro'
-              : 'FTMO / Prop Firm',
-          accountSize: enrollAccountSize,
-          experienceLevel: enrollExperience,
-        },
-      });
-    } else {
-      onLaunchTerminal();
+    try {
+      if (onEnrollUser) {
+        await onEnrollUser({
+          email: enrollEmail.trim(),
+          displayName: enrollName.trim(),
+          password: enrollPassword,
+          country: enrollCountry,
+          tradingProfile: {
+            primaryHorizon: enrollHorizon,
+            brokerName:
+              enrollBroker === 'ic_markets'
+                ? 'IC Markets Global (Raw ECN)'
+                : enrollBroker === 'pepperstone'
+                ? 'Pepperstone Razor'
+                : enrollBroker === 'tickmill'
+                ? 'Tickmill Pro'
+                : 'FTMO / Prop Firm',
+            accountSize: enrollAccountSize,
+            experienceLevel: enrollExperience,
+          },
+        });
+      } else {
+        onLaunchTerminal();
+      }
+    } catch (err: unknown) {
+      setEnrollError(err instanceof Error ? err.message : 'Sign-up failed. Please check your details.');
+    } finally {
+      setIsSubmittingEnroll(false);
     }
   };
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 font-sans selection:bg-amber-500/20 selection:text-amber-300">
       {/* 1. TOP STICKY LANDING NAVBAR */}
-      <header className="sticky top-0 z-40 bg-slate-950/90 backdrop-blur-md border-b border-slate-800/80 px-4 sm:px-8 py-3.5 flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-amber-400 via-amber-500 to-amber-600 flex items-center justify-center shadow-md">
+      <header className="sticky top-0 z-40 bg-slate-950/90 backdrop-blur-md border-b border-slate-800/80 px-3 sm:px-8 py-3 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
+          <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-amber-400 via-amber-500 to-amber-600 flex items-center justify-center shadow-md shrink-0">
             <span className="font-mono font-black text-slate-950 text-base">AU</span>
           </div>
-          <div>
+          <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <span className="font-bold tracking-tight text-base sm:text-lg text-slate-100">
+              <span className="font-bold tracking-tight text-base sm:text-lg text-slate-100 truncate">
                 GoldVista
               </span>
               <span className="text-[10px] font-mono text-amber-400 font-semibold uppercase tracking-wider hidden sm:inline">
@@ -142,7 +167,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
               </span>
             </div>
             <p className="text-[10px] text-slate-400 font-mono hidden md:block">
-              Institutional Gold & Multi-Commodity Advisory Platform
+              Institutional Gold &amp; Multi-Commodity Advisory Platform
             </p>
           </div>
         </div>
@@ -155,7 +180,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           <div className="flex items-center gap-2">
             <span className="text-slate-400">XAU/USD:</span>
             <span className="font-bold text-amber-400 tabular-nums">${goldQuote.mid.toFixed(2)}</span>
-            <span className="text-[11px] text-emerald-400">+{goldQuote.change24hPct}%</span>
+            <span className="text-[11px] text-emerald-400 tabular-nums">+{goldQuote.change24hPct}%</span>
           </div>
           <span className="text-slate-700">|</span>
           <div className="flex items-center gap-2">
@@ -169,21 +194,65 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           </div>
         </div>
 
-        {/* Right CTA Actions */}
-        <div className="flex items-center gap-2.5">
-          <button
-            onClick={() => onOpenAuth('LOGIN')}
-            className="px-3.5 py-1.5 text-xs font-medium text-slate-300 hover:text-slate-100 transition-colors"
-          >
-            Sign In
-          </button>
-          <button
-            onClick={onLaunchTerminal}
-            className="px-4 py-2 bg-gradient-to-r from-amber-500 to-amber-400 hover:from-amber-400 hover:to-amber-300 text-slate-950 font-bold rounded-lg text-xs shadow-md transition-all flex items-center gap-1.5 cursor-pointer"
-          >
-            <span>Launch Live Terminal</span>
-            <ArrowRight className="w-3.5 h-3.5" />
-          </button>
+        {/* Right CTA Actions (Authenticated vs Guest) */}
+        <div className="flex items-center gap-1.5 sm:gap-2.5 shrink-0">
+          {isAuthenticated && userSession ? (
+            <>
+              <div className="hidden md:flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-xs font-mono">
+                <span className="text-slate-200 font-semibold truncate max-w-[120px]">
+                  {userSession.displayName}
+                </span>
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 font-bold uppercase">
+                  {userSession.role}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={onLaunchTerminal}
+                className="min-h-[40px] px-3 sm:px-4 py-2 bg-gradient-to-r from-amber-500 to-amber-400 hover:from-amber-400 hover:to-amber-300 text-slate-950 font-bold rounded-lg text-xs shadow-md transition-all flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
+              >
+                <span>Open Terminal</span>
+                <ArrowRight className="w-3.5 h-3.5 shrink-0" />
+              </button>
+              {onLogout && (
+                <button
+                  type="button"
+                  onClick={onLogout}
+                  aria-label="Sign Out"
+                  className="min-h-[40px] px-2.5 sm:px-3 py-2 bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border border-rose-500/30 font-semibold rounded-lg text-xs transition-colors flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
+                >
+                  <LogOut className="w-3.5 h-3.5 shrink-0" />
+                  <span>Sign Out</span>
+                </button>
+              )}
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={() => onOpenAuth('LOGIN')}
+                className="min-h-[40px] px-2.5 sm:px-3.5 py-2 text-xs font-medium text-slate-200 hover:text-white border border-slate-700/80 hover:border-slate-600 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+              >
+                Sign In
+              </button>
+              <button
+                type="button"
+                onClick={() => onOpenAuth('ENROLL')}
+                className="min-h-[40px] px-3 sm:px-4 py-2 bg-gradient-to-r from-amber-500 to-amber-400 hover:from-amber-400 hover:to-amber-300 text-slate-950 font-bold rounded-lg text-xs shadow-md transition-all flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
+              >
+                <UserPlus className="w-3.5 h-3.5 shrink-0" />
+                <span>Sign Up</span>
+              </button>
+              <button
+                type="button"
+                onClick={onLaunchTerminal}
+                className="hidden sm:flex min-h-[40px] px-3.5 py-2 bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700 font-medium rounded-lg text-xs transition-colors items-center gap-1.5 whitespace-nowrap cursor-pointer"
+              >
+                <span>Terminal</span>
+                <ArrowRight className="w-3.5 h-3.5 shrink-0" />
+              </button>
+            </>
+          )}
         </div>
       </header>
 
@@ -196,8 +265,8 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           {/* Left Column: Core Value Proposition & Live Trust Metrics */}
           <div className="lg:col-span-7 space-y-6 text-left">
             <div className="flex items-center gap-2 text-xs font-mono text-amber-400 flex-wrap">
-              <span className="inline-block w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-              <span>COMEX & LBMA CONTINUOUS INDICATIVE REFERENCE</span>
+              <span className="inline-block w-2 h-2 rounded-full bg-amber-400" />
+              <span>COMEX &amp; LBMA CONTINUOUS INDICATIVE REFERENCE</span>
               <span aria-hidden="true">·</span>
               <span>DECISION SUPPORT ONLY</span>
               <span aria-hidden="true">·</span>
@@ -205,7 +274,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
             </div>
 
             <h1 className="text-3xl sm:text-5xl lg:text-5xl font-extrabold tracking-tight text-slate-100 leading-[1.12]">
-              Institutional Gold & Commodity Intelligence Built For{' '}
+              Institutional Gold &amp; Commodity Intelligence Built For{' '}
               <span className="text-transparent bg-clip-text bg-gradient-to-r from-amber-300 via-amber-400 to-amber-500">
                 Mathematical Expectancy
               </span>
@@ -237,160 +306,303 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
             {/* Quick CTAs */}
             <div className="flex flex-wrap items-center gap-3 pt-2">
-              <button
-                onClick={() => onOpenAuth('ENROLL')}
-                className="px-6 py-3 bg-gradient-to-r from-amber-500 to-amber-400 hover:from-amber-400 hover:to-amber-300 text-slate-950 font-bold rounded-lg text-xs shadow-xl transition-all flex items-center gap-2 cursor-pointer"
-              >
-                <Zap className="w-4 h-4 fill-slate-950" />
-                <span>Enroll Free · Claim 5 Welcome Credits</span>
-              </button>
-              <button
-                onClick={onLaunchTerminal}
-                className="px-5 py-3 bg-slate-900 hover:bg-slate-850 text-slate-200 border border-slate-800 hover:border-slate-700 font-medium rounded-lg text-xs transition-colors flex items-center gap-2 cursor-pointer"
-              >
-                <CandlestickChart className="w-4 h-4 text-amber-400" />
-                <span>Open Terminal Workspace</span>
-              </button>
+              {isAuthenticated ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={onLaunchTerminal}
+                    className="min-h-[44px] px-6 py-3 bg-gradient-to-r from-amber-500 to-amber-400 hover:from-amber-400 hover:to-amber-300 text-slate-950 font-bold rounded-lg text-xs shadow-xl transition-all flex items-center gap-2 cursor-pointer"
+                  >
+                    <CandlestickChart className="w-4 h-4" />
+                    <span>Resume Trading Terminal</span>
+                  </button>
+                  {onLogout && (
+                    <button
+                      type="button"
+                      onClick={onLogout}
+                      className="min-h-[44px] px-5 py-3 bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border border-rose-500/30 font-semibold rounded-lg text-xs transition-colors flex items-center gap-2 cursor-pointer"
+                    >
+                      <LogOut className="w-4 h-4" />
+                      <span>Sign Out</span>
+                    </button>
+                  )}
+                </>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => onOpenAuth('ENROLL')}
+                    className="min-h-[44px] px-6 py-3 bg-gradient-to-r from-amber-500 to-amber-400 hover:from-amber-400 hover:to-amber-300 text-slate-950 font-bold rounded-lg text-xs shadow-xl transition-all flex items-center gap-2 cursor-pointer"
+                  >
+                    <Zap className="w-4 h-4 fill-slate-950" />
+                    <span>Sign Up Free · Claim 5 Welcome Credits</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onOpenAuth('LOGIN')}
+                    className="min-h-[44px] px-5 py-3 bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700 font-medium rounded-lg text-xs transition-colors flex items-center gap-2 cursor-pointer"
+                  >
+                    <span>Sign In</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onLaunchTerminal}
+                    className="min-h-[44px] px-5 py-3 bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-800 hover:border-slate-700 font-medium rounded-lg text-xs transition-colors flex items-center gap-2 cursor-pointer"
+                  >
+                    <CandlestickChart className="w-4 h-4 text-amber-400" />
+                    <span>Open Terminal Workspace</span>
+                  </button>
+                </>
+              )}
             </div>
           </div>
 
-          {/* Right Column: Direct Fast Enrollment Form (Collects User Details) */}
-          <div className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-2xl relative">
-            <div className="flex items-center justify-between pb-3.5 border-b border-slate-800">
-              <div className="flex items-center gap-2">
-                <div className="w-7 h-7 rounded-lg bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-400">
-                  <User className="w-4 h-4" />
+          {/* Right Column: Direct Fast Sign-Up Form OR Active Authenticated Session Card */}
+          {isAuthenticated && userSession ? (
+            <div className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-2xl space-y-5">
+              <div className="flex items-center justify-between pb-3.5 border-b border-slate-800">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="w-9 h-9 rounded-full bg-amber-500/20 border border-amber-500/40 flex items-center justify-center text-amber-400 font-bold shrink-0">
+                    {userSession.displayName.charAt(0).toUpperCase()}
+                  </div>
+                  <div className="min-w-0">
+                    <h3 className="text-sm font-bold text-slate-100 truncate">{userSession.displayName}</h3>
+                    <span className="text-[11px] font-mono text-slate-400 truncate block">{userSession.email}</span>
+                  </div>
                 </div>
-                <div>
-                  <h3 className="text-sm font-bold text-slate-100">Trader Enrollment Gateway</h3>
-                  <span className="text-[10px] font-mono text-emerald-400">Includes 5 Free Welcome Credits</span>
-                </div>
-              </div>
-              <span className="text-[10px] font-mono text-amber-400 bg-amber-500/10 border border-amber-500/30 px-2 py-0.5 rounded">
-                Free Lifetime Tier
-              </span>
-            </div>
-
-            <form onSubmit={handleEmbeddedSubmit} className="space-y-3.5 mt-4 text-xs font-sans">
-              <div>
-                <label className="block text-[11px] font-mono text-slate-400 mb-1">
-                  Full Name or Trader Handle
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={enrollName}
-                  onChange={(e) => setEnrollName(e.target.value)}
-                  placeholder="e.g. Alex Vance"
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-amber-400"
-                />
-              </div>
-
-              <div>
-                <label className="block text-[11px] font-mono text-slate-400 mb-1">
-                  Trader / Institutional Email
-                </label>
-                <input
-                  type="email"
-                  required
-                  value={enrollEmail}
-                  onChange={(e) => setEnrollEmail(e.target.value)}
-                  placeholder="alex.vance@commodity-alpha.com"
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-amber-400"
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-2.5">
-                <div>
-                  <label className="block text-[11px] font-mono text-slate-400 mb-1">
-                    Primary Horizon
-                  </label>
-                  <select
-                    value={enrollHorizon}
-                    onChange={(e) => setEnrollHorizon(e.target.value as any)}
-                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-2 text-xs text-slate-100 focus:outline-none focus:border-amber-400 font-mono"
-                  >
-                    <option value="SWING">H4 Swing Trend</option>
-                    <option value="INTRADAY">M15 Session Scalp</option>
-                    <option value="PROP_FIRM">Prop Firm Challenge</option>
-                    <option value="MACRO">Macro Secular Cycle</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-[11px] font-mono text-slate-400 mb-1">
-                    Broker / Desk
-                  </label>
-                  <select
-                    value={enrollBroker}
-                    onChange={(e) => setEnrollBroker(e.target.value)}
-                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-2 text-xs text-slate-100 focus:outline-none focus:border-amber-400 font-mono"
-                  >
-                    <option value="ic_markets">IC Markets (Free Pro)</option>
-                    <option value="pepperstone">Pepperstone (Free Pro)</option>
-                    <option value="tickmill">Tickmill (Free Pro)</option>
-                    <option value="ftmo">FTMO / Prop Firm</option>
-                    <option value="other">Other Liquidity Provider</option>
-                  </select>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-2.5">
-                <div>
-                  <label className="block text-[11px] font-mono text-slate-400 mb-1">
-                    Account Size
-                  </label>
-                  <select
-                    value={enrollAccountSize}
-                    onChange={(e) => setEnrollAccountSize(e.target.value)}
-                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-2 text-xs text-slate-100 focus:outline-none focus:border-amber-400 font-mono"
-                  >
-                    <option value="$10k - $25k">$10k - $25k</option>
-                    <option value="$50,000 - $100,000">$50,000 - $100,000</option>
-                    <option value="$100k+ Prop Challenge">$100k+ Prop Challenge</option>
-                    <option value="$250,000+ Institutional">$250,000+ Desk</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-[11px] font-mono text-slate-400 mb-1">
-                    Country / Hub
-                  </label>
-                  <select
-                    value={enrollCountry}
-                    onChange={(e) => setEnrollCountry(e.target.value)}
-                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-2 text-xs text-slate-100 focus:outline-none focus:border-amber-400 font-mono"
-                  >
-                    <option value="United States">United States</option>
-                    <option value="United Kingdom">United Kingdom</option>
-                    <option value="European Union">European Union</option>
-                    <option value="Switzerland">Switzerland</option>
-                    <option value="United Arab Emirates">United Arab Emirates</option>
-                    <option value="Singapore">Singapore</option>
-                    <option value="Australia">Australia</option>
-                    <option value="Global">Other Global</option>
-                  </select>
-                </div>
-              </div>
-
-              <button
-                type="submit"
-                disabled={isSubmittingEnroll}
-                className="w-full mt-2 py-3 px-4 bg-gradient-to-r from-amber-500 to-amber-400 hover:from-amber-400 hover:to-amber-300 text-slate-950 font-bold rounded-lg text-xs shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer"
-              >
-                <Zap className="w-4 h-4 fill-slate-950" />
-                <span>Complete Free Enrollment & Launch Platform</span>
-              </button>
-
-              <div className="flex items-center justify-between pt-1 text-[10px] font-mono text-slate-500">
-                <span className="flex items-center gap-1">
-                  <ShieldCheck className="w-3 h-3 text-emerald-400" />
-                  No credit card required
+                <span className="text-[10px] font-mono text-emerald-400 bg-emerald-500/10 border border-emerald-500/30 px-2 py-0.5 rounded font-bold uppercase shrink-0">
+                  {userSession.role} ACTIVE
                 </span>
-                <span>Instant Platform Access</span>
               </div>
-            </form>
-          </div>
+
+              <div className="p-4 bg-slate-950 border border-slate-800 rounded-lg space-y-2 text-xs font-mono">
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-400">Session Status</span>
+                  <span className="text-emerald-400 font-semibold">Signed In &amp; Portfolio Isolated</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-400">Primary Horizon</span>
+                  <span className="text-slate-200">{userSession.tradingProfile?.primaryHorizon || 'SWING'}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-400">Desk / Broker</span>
+                  <span className="text-slate-200 truncate max-w-[180px]">{userSession.tradingProfile?.brokerName || 'Standard Reference'}</span>
+                </div>
+              </div>
+
+              <div className="space-y-2.5">
+                <button
+                  type="button"
+                  onClick={onLaunchTerminal}
+                  className="w-full min-h-[44px] py-3 px-4 bg-gradient-to-r from-amber-500 to-amber-400 hover:from-amber-400 hover:to-amber-300 text-slate-950 font-bold rounded-lg text-xs shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  <CandlestickChart className="w-4 h-4" />
+                  <span>Enter Trading Terminal</span>
+                </button>
+
+                {onLogout && (
+                  <button
+                    type="button"
+                    onClick={onLogout}
+                    className="w-full min-h-[44px] py-2.5 px-4 bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border border-rose-500/30 font-semibold rounded-lg text-xs transition-colors flex items-center justify-center gap-2 cursor-pointer"
+                  >
+                    <LogOut className="w-4 h-4" />
+                    <span>Sign Out of Account</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => onOpenAuth('ENROLL')}
+                  className="w-full py-2 text-center text-xs font-mono text-amber-400 hover:underline cursor-pointer"
+                >
+                  Create or Switch to Another Account &rarr;
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-xl p-5 sm:p-6 shadow-2xl relative">
+              <div className="flex items-center justify-between pb-3.5 border-b border-slate-800 gap-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <div className="w-7 h-7 rounded-lg bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-400 shrink-0">
+                    <User className="w-4 h-4" />
+                  </div>
+                  <div className="min-w-0">
+                    <h3 className="text-sm font-bold text-slate-100">Create Free Account</h3>
+                    <span className="text-[10px] font-mono text-emerald-400">Includes 5 Free Welcome Credits</span>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => onOpenAuth('LOGIN')}
+                  className="text-[11px] font-mono text-amber-400 hover:underline whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  Sign In &rarr;
+                </button>
+              </div>
+
+              {enrollError && (
+                <div role="alert" className="mt-3 p-2.5 rounded-lg bg-rose-500/10 border border-rose-500/30 text-xs text-rose-200 flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                  <span>{enrollError}</span>
+                </div>
+              )}
+
+              <form onSubmit={handleEmbeddedSubmit} className="space-y-3 mt-4 text-xs font-sans" noValidate>
+                <div>
+                  <label htmlFor="landing-fullname" className="block text-[11px] font-mono text-slate-400 mb-1">
+                    Full Name or Trader Handle
+                  </label>
+                  <input
+                    id="landing-fullname"
+                    type="text"
+                    required
+                    autoComplete="name"
+                    value={enrollName}
+                    onChange={(e) => setEnrollName(e.target.value)}
+                    placeholder="e.g. Alex Vance"
+                    className="w-full min-h-[44px] sm:min-h-[40px] bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm sm:text-xs text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-amber-400"
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="landing-email" className="block text-[11px] font-mono text-slate-400 mb-1">
+                    Trader / Institutional Email
+                  </label>
+                  <input
+                    id="landing-email"
+                    type="email"
+                    required
+                    autoComplete="email"
+                    value={enrollEmail}
+                    onChange={(e) => setEnrollEmail(e.target.value)}
+                    placeholder="alex.vance@commodity-alpha.com"
+                    className="w-full min-h-[44px] sm:min-h-[40px] bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm sm:text-xs text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-amber-400"
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="landing-password" className="block text-[11px] font-mono text-slate-400 mb-1">
+                    Account Password <span className="text-slate-500">(min. 8 characters)</span>
+                  </label>
+                  <div className="relative">
+                    <input
+                      id="landing-password"
+                      type={showEnrollPassword ? 'text' : 'password'}
+                      required
+                      autoComplete="new-password"
+                      value={enrollPassword}
+                      onChange={(e) => setEnrollPassword(e.target.value)}
+                      placeholder="Create a secure password"
+                      className="w-full min-h-[44px] sm:min-h-[40px] bg-slate-950 border border-slate-800 rounded-lg pl-3 pr-10 py-2 text-sm sm:text-xs text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-amber-400"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowEnrollPassword((prev) => !prev)}
+                      aria-label={showEnrollPassword ? 'Hide password' : 'Show password'}
+                      className="absolute right-1 top-1/2 -translate-y-1/2 p-2 text-slate-400 hover:text-slate-200 cursor-pointer"
+                    >
+                      {showEnrollPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2.5">
+                  <div>
+                    <label htmlFor="landing-horizon" className="block text-[11px] font-mono text-slate-400 mb-1">
+                      Primary Horizon
+                    </label>
+                    <select
+                      id="landing-horizon"
+                      value={enrollHorizon}
+                      onChange={(e) => setEnrollHorizon(e.target.value as 'INTRADAY' | 'SWING' | 'PROP_FIRM' | 'MACRO')}
+                      className="w-full min-h-[44px] sm:min-h-[40px] bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-2 text-sm sm:text-xs text-slate-100 focus:outline-none focus:border-amber-400 font-mono"
+                    >
+                      <option value="SWING">H4 Swing Trend</option>
+                      <option value="INTRADAY">M15 Session Scalp</option>
+                      <option value="PROP_FIRM">Prop Firm Challenge</option>
+                      <option value="MACRO">Macro Secular Cycle</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label htmlFor="landing-broker" className="block text-[11px] font-mono text-slate-400 mb-1">
+                      Broker / Desk
+                    </label>
+                    <select
+                      id="landing-broker"
+                      value={enrollBroker}
+                      onChange={(e) => setEnrollBroker(e.target.value)}
+                      className="w-full min-h-[44px] sm:min-h-[40px] bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-2 text-sm sm:text-xs text-slate-100 focus:outline-none focus:border-amber-400 font-mono"
+                    >
+                      <option value="ic_markets">IC Markets (Free Pro)</option>
+                      <option value="pepperstone">Pepperstone (Free Pro)</option>
+                      <option value="tickmill">Tickmill (Free Pro)</option>
+                      <option value="ftmo">FTMO / Prop Firm</option>
+                      <option value="other">Other Liquidity Provider</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2.5">
+                  <div>
+                    <label htmlFor="landing-size" className="block text-[11px] font-mono text-slate-400 mb-1">
+                      Account Size
+                    </label>
+                    <select
+                      id="landing-size"
+                      value={enrollAccountSize}
+                      onChange={(e) => setEnrollAccountSize(e.target.value)}
+                      className="w-full min-h-[44px] sm:min-h-[40px] bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-2 text-sm sm:text-xs text-slate-100 focus:outline-none focus:border-amber-400 font-mono"
+                    >
+                      <option value="$10k - $25k">$10k - $25k</option>
+                      <option value="$50,000 - $100,000">$50,000 - $100,000</option>
+                      <option value="$100k+ Prop Challenge">$100k+ Prop Challenge</option>
+                      <option value="$250,000+ Institutional">$250,000+ Desk</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label htmlFor="landing-country" className="block text-[11px] font-mono text-slate-400 mb-1">
+                      Country / Hub
+                    </label>
+                    <select
+                      id="landing-country"
+                      value={enrollCountry}
+                      onChange={(e) => setEnrollCountry(e.target.value)}
+                      className="w-full min-h-[44px] sm:min-h-[40px] bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-2 text-sm sm:text-xs text-slate-100 focus:outline-none focus:border-amber-400 font-mono"
+                    >
+                      <option value="United States">United States</option>
+                      <option value="United Kingdom">United Kingdom</option>
+                      <option value="European Union">European Union</option>
+                      <option value="Switzerland">Switzerland</option>
+                      <option value="United Arab Emirates">United Arab Emirates</option>
+                      <option value="Singapore">Singapore</option>
+                      <option value="Australia">Australia</option>
+                      <option value="Global">Other Global</option>
+                    </select>
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={isSubmittingEnroll}
+                  className="w-full min-h-[44px] mt-2 py-3 px-4 bg-gradient-to-r from-amber-500 to-amber-400 hover:from-amber-400 hover:to-amber-300 text-slate-950 font-bold rounded-lg text-xs shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                >
+                  <UserPlus className="w-4 h-4 shrink-0" />
+                  <span>{isSubmittingEnroll ? 'Creating Account...' : 'Create Free Account & Launch Platform'}</span>
+                </button>
+
+                <div className="flex items-center justify-between pt-1 text-[10px] font-mono text-slate-500">
+                  <span className="flex items-center gap-1">
+                    <ShieldCheck className="w-3 h-3 text-emerald-400" />
+                    No credit card required
+                  </span>
+                  <span>Instant Platform Access</span>
+                </div>
+              </form>
+            </div>
+          )}
         </div>
 
         {/* 3. BESPOKE ELEGANT VECTOR GRAPHIC: INSTITUTIONAL EXECUTION CORRIDOR */}
@@ -712,10 +924,11 @@ export const LandingPage: React.FC<LandingPageProps> = ({
               </div>
 
               <button
+                type="button"
                 onClick={() => onOpenAuth('ENROLL')}
-                className="mt-6 w-full py-2.5 px-4 bg-slate-800 hover:bg-slate-750 text-slate-100 font-bold rounded-lg text-xs transition-colors cursor-pointer"
+                className="mt-6 w-full min-h-[44px] py-2.5 px-4 bg-slate-800 hover:bg-slate-700 text-slate-100 font-bold rounded-lg text-xs transition-colors cursor-pointer"
               >
-                Enroll Free (Claim 5 Credits)
+                Sign Up Free (Claim 5 Credits)
               </button>
             </div>
 
@@ -849,16 +1062,24 @@ export const LandingPage: React.FC<LandingPageProps> = ({
             </p>
           </div>
 
-          <div className="flex items-center gap-6">
-            <button onClick={onLaunchTerminal} className="hover:text-amber-400 transition-colors">
+          <div className="flex flex-wrap items-center gap-4 sm:gap-6">
+            <button type="button" onClick={onLaunchTerminal} className="hover:text-amber-400 transition-colors cursor-pointer">
               Platform Terminal
             </button>
-            <button onClick={() => onOpenAuth('LOGIN')} className="hover:text-amber-400 transition-colors">
-              Member Sign In
-            </button>
-            <button onClick={() => onOpenAuth('ENROLL')} className="hover:text-amber-400 transition-colors">
-              Free Enrollment
-            </button>
+            {isAuthenticated && onLogout ? (
+              <button type="button" onClick={onLogout} className="hover:text-rose-400 text-rose-300 transition-colors cursor-pointer">
+                Sign Out
+              </button>
+            ) : (
+              <>
+                <button type="button" onClick={() => onOpenAuth('LOGIN')} className="hover:text-amber-400 transition-colors cursor-pointer">
+                  Sign In
+                </button>
+                <button type="button" onClick={() => onOpenAuth('ENROLL')} className="hover:text-amber-400 transition-colors cursor-pointer">
+                  Sign Up Free
+                </button>
+              </>
+            )}
           </div>
 
           <div className="text-[10px] text-slate-600 w-full pt-4 border-t border-slate-900">

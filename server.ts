@@ -4,12 +4,12 @@
  * Aurum Intelligence — Full-Stack Server & Production API Gateway
  */
 
+import 'dotenv/config';
 import express from 'express';
 import fs from 'node:fs';
 import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
 import { canonicalMarketDataRouter, ProviderConfig } from './src/services/marketDataProvider';
 import { canonicalNotificationService, NotificationConfig, NotificationEvent } from './src/services/notificationService';
@@ -19,20 +19,37 @@ import {
   validateCandleSeries,
   validateQuoteIntegrity,
 } from './src/services/marketData';
-import { generateIndicatorSnapshot } from './src/services/indicators';
+import {
+  CustomRsiAlertConfig,
+  evaluateAtrVolatilityBreakout,
+  evaluateCustomRsiAlerts,
+  generateIndicatorSnapshot,
+  RsiConditionOperator,
+} from './src/services/indicators';
 import { calculateCFDRisk } from './src/services/riskEngine';
 import {
   CURRENT_MARKET_REGIME,
   MACRO_ECONOMIC_RELEASES,
   HISTORICAL_EVENT_STUDIES,
   findHistoricalAnalogs,
+  buildHistoricalYearAnalogCandles,
+  HISTORICAL_YEAR_ANALOG_PRESETS,
 } from './src/services/macroData';
-import { getQuantitativeStrategies, QUANTITATIVE_STRATEGIES, runBacktestSimulation } from './src/services/strategyEngine';
-import { EVIDENCE_REGISTRY, SPECIALIST_AGENTS, getEvidenceRegistry, getSpecialistAgents, generateTradePlans } from './src/services/advisoryEngine';
-import { InstrumentId, Timeframe, CommodityType, HistoricalRangePeriod } from './src/domain/types';
+import {
+  evaluateStrategyEntryCriteria,
+  getQuantitativeStrategies,
+  QUANTITATIVE_STRATEGIES,
+  runBacktestSimulation,
+  StrategyAlertSubscription,
+} from './src/services/strategyEngine';
+import { EVIDENCE_REGISTRY, SPECIALIST_AGENTS, getEvidenceRegistry, getSpecialistAgents, generateTradePlans, buildStrategyBiasRationale, StrategyBiasRationale } from './src/services/advisoryEngine';
+import { AdvisoryHorizon, InstrumentId, Timeframe, CommodityType, HistoricalRangePeriod } from './src/domain/types';
 import { CANONICAL_COMMODITY_REGISTRY, COMMODITY_DRIVER_PROFILES, getPrimaryInstrumentForCommodity } from './src/services/commodityRegistry';
 import { generateMultiCommodityHistory } from './src/services/historicalDataEngine';
-import { fetchRealHistoricalChartData } from './src/services/realHistoricalProvider';
+import {
+  fetchHistoricalYearComparisonData,
+  fetchRealHistoricalChartData,
+} from './src/services/realHistoricalProvider';
 import { getFilteredNewsEvidence, calculateCommoditySentiment, CANONICAL_ECONOMIC_CALENDAR } from './src/services/newsSentimentEngine';
 import { getCommodityScenarios, getCommodityAnalogues } from './src/services/historicalScenariosEngine';
 import { canonicalLLMPlatform } from './src/services/llmPlatform';
@@ -46,11 +63,13 @@ import {
 } from './src/services/billingWebhookEngine';
 import {
   buildContentSecurityPolicy,
+  buildEnvHydrationConfigs,
   evaluateCorsOrigin,
   evaluateServerRoleFromToken,
   evaluateServerRoleFromTokenAsync,
   FixedWindowRateLimiter,
   isSandboxPersonasEnabled,
+  isTemplatePlaceholderValue,
   redactSensitiveLogValue,
   requireServerRole,
   signServerSessionToken,
@@ -80,7 +99,44 @@ import {
 } from './src/services/forecastAccountability';
 import { generateComprehensiveScorecard } from './src/services/forecastScorecardEngine';
 import { generateInstitutionalReport } from './src/services/institutionalReportEngine';
-import { runPortfolioScenarioMatrix } from './src/services/portfolioScannerEngine';
+import {
+  computeEntryPriceDeviationPct,
+  DEFAULT_GHOST_DEVIATION_THRESHOLD_PCT,
+  getInstrumentMultiplierForMae,
+  runPortfolioScenarioMatrix,
+} from './src/services/portfolioScannerEngine';
+import {
+  calculateMacroCorrelationMatrix,
+  calculateRolling30DayCorrelationSeries,
+  CorrelationWindow,
+  evaluateXauDxyCorrelationDeviationAlert,
+  evaluateXauGsciCorrelationAlert,
+  evaluateXauYieldCorrelationBreakoutAlert,
+  GsciAlertMode,
+} from './src/services/crossCommoditySpreads';
+import {
+  calculateGoldCotInstitutionalSentiment,
+  CANONICAL_COT_REPORTS,
+  CotWeeklySnapshot,
+  GOLD_COT_WEEKLY_HISTORY,
+  InstitutionalSentimentScope,
+} from './src/services/cotIntelligence';
+import {
+  BrokerVenueFilter,
+  calculateInstitutionalOrderQueue,
+  QueueOrderTypeFilter,
+} from './src/services/institutionalQueueEngine';
+import {
+  buildInstitutionalL2OrderBook,
+  L2ExecutionMode,
+  L2FeeTier,
+  L2LiquiditySession,
+  simulateBacktestL2Execution,
+} from './src/services/advancedBacktestingEngine';
+import {
+  buildInstitutionalPdfReport,
+  InstitutionalReportCategory,
+} from './src/services/pdfReportExporter';
 
 const BILLING_STORE_PATH = process.env.AURUM_BILLING_STORE_PATH || '/tmp/aurum-billing-store.json';
 const FORECAST_STORE_PATH = process.env.AURUM_FORECAST_STORE_PATH || '/tmp/aurum-forecast-store.json';
@@ -90,11 +146,26 @@ interface PaperJournalFileStore {
   byUser: Record<string, PaperPosition[]>;
 }
 
+const DEMO_SEEDED_USER_IDS = new Set<string>([
+  'usr_demo_trader',
+  'usr_guest_0000',
+  'usr_free_1029',
+  'usr_pro_4412',
+  'usr_alpha_9901',
+]);
+
+function isDemoPersonaUserId(userId: string): boolean {
+  return DEMO_SEEDED_USER_IDS.has(userId);
+}
+
+const seededDemoPostgresUsers = new Set<string>();
+
 function getInitialSeedPositions(goldMid = 3950): PaperPosition[] {
   return [
     {
       id: 'POS-01',
       tradePlanId: 'PLAN-SWING-03',
+      advisoryHorizon: 'SWING',
       instrumentId: 'XAUUSD',
       direction: 'BUY',
       lots: 2.0,
@@ -102,6 +173,7 @@ function getInitialSeedPositions(goldMid = 3950): PaperPosition[] {
       currentPrice: goldMid,
       stopLoss: 3865.0,
       takeProfit: 3935.0,
+      adverseExtremePrice: Math.min(3879.4, goldMid),
       unrealizedPnl: Number(((goldMid - 3885.0) * 2.0 * 100).toFixed(2)),
       realizedPnl: 0,
       openTime: '2026-11-01T04:30:00Z',
@@ -111,6 +183,7 @@ function getInitialSeedPositions(goldMid = 3950): PaperPosition[] {
     {
       id: 'POS-02',
       tradePlanId: 'PLAN-INTRADAY-01',
+      advisoryHorizon: 'INTRADAY',
       instrumentId: 'XAUUSD',
       direction: 'BUY',
       lots: 1.5,
@@ -118,11 +191,228 @@ function getInitialSeedPositions(goldMid = 3950): PaperPosition[] {
       currentPrice: 3884.5,
       stopLoss: 3850.0,
       takeProfit: 3884.5,
+      adverseExtremePrice: 3859.2,
       unrealizedPnl: 0,
       realizedPnl: Number(((3884.5 - 3862.5) * 1.5 * 100).toFixed(2)),
       openTime: '2026-10-31T14:15:00Z',
       status: 'CLOSED_PROFIT',
-      notes: 'London session breakout setup; cleanly hit TP1 with zero adverse excursion.',
+      notes: 'London session breakout setup; cleanly hit TP1 with minimal adverse excursion.',
+    },
+    {
+      id: 'POS-03',
+      tradePlanId: 'PLAN-SWING-02',
+      advisoryHorizon: 'SWING',
+      instrumentId: 'XAUUSD',
+      direction: 'BUY',
+      lots: 1.0,
+      entryPrice: 3832.0,
+      currentPrice: 3868.0,
+      stopLoss: 3808.0,
+      takeProfit: 3868.0,
+      adverseExtremePrice: 3818.4,
+      unrealizedPnl: 0,
+      realizedPnl: 3600,
+      openTime: '2026-10-29T09:10:00Z',
+      status: 'CLOSED_PROFIT',
+      notes: 'Held CPI pullback down to $3,818.40 before rallying cleanly to TP1.',
+    },
+    {
+      id: 'POS-04',
+      tradePlanId: 'PLAN-INTRADAY-00',
+      advisoryHorizon: 'INTRADAY',
+      instrumentId: 'XAUUSD',
+      direction: 'BUY',
+      lots: 1.0,
+      entryPrice: 3846.0,
+      currentPrice: 3826.0,
+      stopLoss: 3826.0,
+      takeProfit: 3886.0,
+      adverseExtremePrice: 3826.0,
+      unrealizedPnl: 0,
+      realizedPnl: -2000,
+      openTime: '2026-10-27T13:40:00Z',
+      status: 'CLOSED_LOSS',
+      notes: 'Stopped out on DXY rebound liquidity sweep at exact $3,826.00 stop.',
+    },
+    {
+      id: 'POS-05',
+      tradePlanId: 'PLAN-SWING-01',
+      advisoryHorizon: 'SWING',
+      instrumentId: 'XAUUSD',
+      direction: 'SELL',
+      lots: 1.0,
+      entryPrice: 3915.0,
+      currentPrice: 3871.0,
+      stopLoss: 3935.0,
+      takeProfit: 3871.0,
+      adverseExtremePrice: 3922.5,
+      unrealizedPnl: 0,
+      realizedPnl: 4400,
+      openTime: '2026-11-02T11:20:00Z',
+      status: 'CLOSED_PROFIT',
+      notes: 'Tactical short from double-top resistance yielded +2.20R.',
+    },
+    {
+      id: 'POS-Q3-03',
+      tradePlanId: 'PLAN-Q3-SEP',
+      advisoryHorizon: 'SWING',
+      instrumentId: 'XAUUSD',
+      direction: 'BUY',
+      lots: 1.0,
+      entryPrice: 3745.0,
+      currentPrice: 3780.0,
+      stopLoss: 3725.0,
+      takeProfit: 3780.0,
+      adverseExtremePrice: 3736.5,
+      unrealizedPnl: 0,
+      realizedPnl: 3500,
+      openTime: '2026-09-18T16:00:00Z',
+      status: 'CLOSED_PROFIT',
+      notes: 'Q3 50bps FOMC rate cut follow-through momentum breakout above $3,750.',
+    },
+    {
+      id: 'POS-Q3-02',
+      tradePlanId: 'PLAN-Q3-AUG',
+      advisoryHorizon: 'LONG_TERM',
+      instrumentId: 'XAUUSD',
+      direction: 'BUY',
+      lots: 1.0,
+      entryPrice: 3655.0,
+      currentPrice: 3710.0,
+      stopLoss: 3635.0,
+      takeProfit: 3710.0,
+      adverseExtremePrice: 3644.0,
+      unrealizedPnl: 0,
+      realizedPnl: 5500,
+      openTime: '2026-08-26T15:05:00Z',
+      status: 'CLOSED_PROFIT',
+      notes: 'Jackson Hole easing pivot confirmation drove sustained Q3 trend expansion.',
+    },
+    {
+      id: 'POS-Q3-01',
+      tradePlanId: 'PLAN-Q3-JUL',
+      advisoryHorizon: 'LONG_TERM',
+      instrumentId: 'XAUUSD',
+      direction: 'BUY',
+      lots: 1.5,
+      entryPrice: 3560.0,
+      currentPrice: 3606.0,
+      stopLoss: 3540.0,
+      takeProfit: 3606.0,
+      adverseExtremePrice: 3552.0,
+      unrealizedPnl: 0,
+      realizedPnl: 6900,
+      openTime: '2026-07-17T12:40:00Z',
+      status: 'CLOSED_PROFIT',
+      notes: 'Early Q3 dovish repricing accumulation off 50 EMA institutional support.',
+    },
+    {
+      id: 'POS-Q2-03',
+      tradePlanId: 'PLAN-Q2-JUN',
+      advisoryHorizon: 'INTRADAY',
+      instrumentId: 'XAUUSD',
+      direction: 'BUY',
+      lots: 1.0,
+      entryPrice: 3440.0,
+      currentPrice: 3420.0,
+      stopLoss: 3420.0,
+      takeProfit: 3470.0,
+      adverseExtremePrice: 3420.0,
+      unrealizedPnl: 0,
+      realizedPnl: -2000,
+      openTime: '2026-06-24T09:20:00Z',
+      status: 'CLOSED_LOSS',
+      notes: 'Quarter-end DXY rebalancing pressure tagged stop during Q2 sticky inflation chop.',
+    },
+    {
+      id: 'POS-Q2-02',
+      tradePlanId: 'PLAN-Q2-MAY',
+      advisoryHorizon: 'SWING',
+      instrumentId: 'XAUUSD',
+      direction: 'SELL',
+      lots: 1.5,
+      entryPrice: 3485.0,
+      currentPrice: 3441.0,
+      stopLoss: 3505.0,
+      takeProfit: 3441.0,
+      adverseExtremePrice: 3493.0,
+      unrealizedPnl: 0,
+      realizedPnl: 6600,
+      openTime: '2026-05-12T14:00:00Z',
+      status: 'CLOSED_PROFIT',
+      notes: 'Mean-reversion short from $3,500 liquidity sweep during Q2 CPI repricing.',
+    },
+    {
+      id: 'POS-Q2-01',
+      tradePlanId: 'PLAN-Q2-APR',
+      advisoryHorizon: 'INTRADAY',
+      instrumentId: 'XAUUSD',
+      direction: 'BUY',
+      lots: 1.0,
+      entryPrice: 3410.0,
+      currentPrice: 3385.0,
+      stopLoss: 3385.0,
+      takeProfit: 3465.0,
+      adverseExtremePrice: 3385.0,
+      unrealizedPnl: 0,
+      realizedPnl: -2500,
+      openTime: '2026-04-14T10:45:00Z',
+      status: 'CLOSED_LOSS',
+      notes: 'Hot US Retail Sales pushed 10Y real yields +12bps, invalidating breakout.',
+    },
+    {
+      id: 'POS-Q1-03',
+      tradePlanId: 'PLAN-Q1-MAR',
+      advisoryHorizon: 'LONG_TERM',
+      instrumentId: 'XAUUSD',
+      direction: 'BUY',
+      lots: 1.2,
+      entryPrice: 3240.0,
+      currentPrice: 3288.0,
+      stopLoss: 3220.0,
+      takeProfit: 3288.0,
+      adverseExtremePrice: 3231.0,
+      unrealizedPnl: 0,
+      realizedPnl: 5760,
+      openTime: '2026-03-19T18:15:00Z',
+      status: 'CLOSED_PROFIT',
+      notes: 'March FOMC SEP hold compressed real yields, driving clean +2.40R trend capture.',
+    },
+    {
+      id: 'POS-Q1-02',
+      tradePlanId: 'PLAN-Q1-FEB',
+      advisoryHorizon: 'SWING',
+      instrumentId: 'XAUUSD',
+      direction: 'SELL',
+      lots: 1.0,
+      entryPrice: 3195.0,
+      currentPrice: 3215.0,
+      stopLoss: 3215.0,
+      takeProfit: 3155.0,
+      adverseExtremePrice: 3215.0,
+      unrealizedPnl: 0,
+      realizedPnl: -2000,
+      openTime: '2026-02-18T13:30:00Z',
+      status: 'CLOSED_LOSS',
+      notes: 'Counter-trend fade stopped out on sovereign physical dip buying.',
+    },
+    {
+      id: 'POS-Q1-01',
+      tradePlanId: 'PLAN-Q1-JAN',
+      advisoryHorizon: 'LONG_TERM',
+      instrumentId: 'XAUUSD',
+      direction: 'BUY',
+      lots: 1.0,
+      entryPrice: 3120.0,
+      currentPrice: 3170.0,
+      stopLoss: 3095.0,
+      takeProfit: 3170.0,
+      adverseExtremePrice: 3109.5,
+      unrealizedPnl: 0,
+      realizedPnl: 5000,
+      openTime: '2026-01-22T15:10:00Z',
+      status: 'CLOSED_PROFIT',
+      notes: 'Q1 sovereign reserve restocking breakout above $3,100 handle.',
     },
   ];
 }
@@ -222,7 +512,13 @@ let postgresEditorialRepo: PostgresEditorialRepository | null = null;
 let postgresPaperJournalRepo: PostgresPaperJournalRepository | null = null;
 let lastMigrationReport: { applied: string[]; skipped: string[]; totalDiscovered: number } | null = null;
 
-dotenv.config();
+const { marketDataUpdate, notificationUpdate } = buildEnvHydrationConfigs(process.env);
+if (Object.keys(marketDataUpdate).length > 0) {
+  canonicalMarketDataRouter.updateConfig(marketDataUpdate);
+}
+if (Object.keys(notificationUpdate).length > 0) {
+  canonicalNotificationService.updateConfig(notificationUpdate);
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -398,9 +694,12 @@ app.get('/health/ready', async (_req, res) => {
     persistenceMode,
     migrations: lastMigrationReport,
     sandboxModeEnabled: isSandboxPersonasEnabled(),
-    oidcConfigured: Boolean(process.env.OAUTH_JWKS_URI),
-    stripeWebhookSecretConfigured: Boolean(process.env.STRIPE_WEBHOOK_SECRET),
-    geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
+    oidcConfigured: !isTemplatePlaceholderValue(process.env.OAUTH_JWKS_URI),
+    stripeWebhookSecretConfigured: !isTemplatePlaceholderValue(process.env.STRIPE_WEBHOOK_SECRET),
+    geminiConfigured: !isTemplatePlaceholderValue(process.env.GEMINI_API_KEY),
+    eiaConfigured: !isTemplatePlaceholderValue(process.env.EIA_API_KEY),
+    fredConfigured: !isTemplatePlaceholderValue(process.env.FRED_API_KEY),
+    telegramConfigured: canonicalNotificationService.getConfig().telegramEnabled,
     time: new Date().toISOString(),
   });
 });
@@ -615,6 +914,50 @@ app.get('/api/market/history', async (req, res) => {
   }
 });
 
+// Fetch Secondary Historical Year Series (e.g., 2008, 2020) for CandleChart Comparison Overlay
+app.get('/api/market/historical-analog', async (req, res) => {
+  const instrumentId = (req.query.instrumentId as InstrumentId) || 'XAUUSD';
+  const rawYear = Number(req.query.year ?? 2020);
+  if (!Number.isFinite(rawYear) || rawYear < 1990 || rawYear > 2025) {
+    res.status(400).json({
+      success: false,
+      error: 'Year must be between 1990 and 2025.',
+    });
+    return;
+  }
+  const year = Math.round(rawYear);
+
+  try {
+    const seriesPayload = await fetchHistoricalYearComparisonData(year, instrumentId);
+    res.json({
+      success: true,
+      instrumentId,
+      barCount: seriesPayload.candles.length,
+      presets: HISTORICAL_YEAR_ANALOG_PRESETS.map((p) => ({
+        year: p.year,
+        label: p.label,
+        shortLabel: p.shortLabel,
+        macroContext: p.macroContext,
+      })),
+      ...seriesPayload,
+    });
+  } catch (err: any) {
+    const fallback = buildHistoricalYearAnalogCandles(year);
+    res.json({
+      success: true,
+      instrumentId,
+      barCount: fallback.candles.length,
+      presets: HISTORICAL_YEAR_ANALOG_PRESETS.map((p) => ({
+        year: p.year,
+        label: p.label,
+        shortLabel: p.shortLabel,
+        macroContext: p.macroContext,
+      })),
+      ...fallback,
+    });
+  }
+});
+
 // Canonical Multi-Commodity Registry & Drivers
 app.get('/api/commodities', (req, res) => {
   res.json({
@@ -719,6 +1062,740 @@ app.post('/api/notifications/test', requireServerRole('PRO'), async (req, res) =
   }
 });
 
+app.post('/api/alerts/atr-volatility', async (req, res) => {
+  if (!applySensitiveRateLimit(req, res)) return;
+  try {
+    const { simulateSpike = false, stdDevThreshold = 2.5, overridePriceMove } = req.body || {};
+    const threshold = Number.isFinite(Number(stdDevThreshold)) ? Number(stdDevThreshold) : 2.5;
+    const xauQuote = await canonicalMarketDataRouter.getQuote('XAUUSD');
+    const dailyCandles = generateCandleHistory('1D', 60, xauQuote.mid);
+
+    const baselineEval = evaluateAtrVolatilityBreakout(dailyCandles, xauQuote, threshold);
+    let evalCandles = dailyCandles;
+    let evalQuote = xauQuote;
+
+    if (simulateSpike || (Number.isFinite(Number(overridePriceMove)) && Number(overridePriceMove) > 0)) {
+      const spikeRange = Number.isFinite(Number(overridePriceMove))
+        ? Number(overridePriceMove)
+        : Number((baselineEval.atr14 + 3.25 * Math.max(baselineEval.trueRangeStdDev14, 1)).toFixed(2));
+      const lastBar = dailyCandles[dailyCandles.length - 1];
+      evalCandles = [
+        ...dailyCandles.slice(0, -1),
+        {
+          ...lastBar,
+          high: Number((lastBar.open + spikeRange).toFixed(2)),
+          low: lastBar.open,
+          close: Number((lastBar.open + spikeRange * 0.9).toFixed(2)),
+        },
+      ];
+      evalQuote = {
+        ...xauQuote,
+        mid: Number((xauQuote.open24h + spikeRange).toFixed(2)),
+      };
+    }
+
+    const evaluation = evaluateAtrVolatilityBreakout(evalCandles, evalQuote, threshold);
+    let dispatchedEvent: NotificationEvent | null = null;
+    let deliveryLogs: any[] = [];
+
+    if (evaluation.isBreached) {
+      dispatchedEvent = {
+        id: `ATR-VOL-${Date.now()}`,
+        category: 'RISK_ALERT',
+        severity: evaluation.severity,
+        title: `XAU/USD ATR Volatility Alert (>${threshold}σ)`,
+        message: evaluation.summary,
+        timestamp: new Date().toISOString(),
+        isCriticalStateChange: true,
+        metadata: {
+          instrumentId: 'XAUUSD',
+          atr14: evaluation.atr14,
+          trueRangeStdDev14: evaluation.trueRangeStdDev14,
+          currentPriceMove: evaluation.currentPriceMove,
+          thresholdPriceMove: evaluation.thresholdPriceMove,
+          zScoreSigma: evaluation.zScoreSigma,
+          stateTransition: true,
+        },
+      };
+      deliveryLogs = await canonicalNotificationService.dispatch(dispatchedEvent);
+    }
+
+    res.json({
+      success: true,
+      evaluation,
+      dispatched: Boolean(dispatchedEvent),
+      dispatchedEvent,
+      deliveryLogs,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: redactSensitiveLogValue(String(err?.message || err)) });
+  }
+});
+
+app.post('/api/alerts/correlation-deviation', async (req, res) => {
+  if (!applySensitiveRateLimit(req, res)) return;
+  try {
+    const {
+      simulateDeviation = false,
+      deviationThreshold = 0.2,
+      overrideRollingCorr,
+    } = req.body || {};
+    const threshold =
+      Number.isFinite(Number(deviationThreshold)) && Number(deviationThreshold) > 0
+        ? Number(deviationThreshold)
+        : 0.2;
+
+    const allQuotes = await canonicalMarketDataRouter.getAllQuotes();
+    const xauQuote = allQuotes.XAUUSD;
+    const dailyCandles = generateCandleHistory('1D', 60, xauQuote?.mid || 3898.9);
+
+    let evalQuotes = allQuotes;
+    if (simulateDeviation && !Number.isFinite(Number(overrideRollingCorr))) {
+      evalQuotes = {
+        ...allQuotes,
+        XAUUSD: { ...(allQuotes.XAUUSD || xauQuote), change24hPct: 1.65 },
+        DXY: { ...(allQuotes.DXY || xauQuote), change24hPct: 1.1 },
+        US10Y: { ...(allQuotes.US10Y || xauQuote), change24hPct: 0.95 },
+      };
+    }
+
+    const evaluation = evaluateXauDxyCorrelationDeviationAlert(evalQuotes, dailyCandles, {
+      deviationThreshold: threshold,
+      overrideRolling30dCorr: Number.isFinite(Number(overrideRollingCorr))
+        ? Number(overrideRollingCorr)
+        : simulateDeviation
+        ? -0.32
+        : undefined,
+    });
+
+    let dispatchedEvent: NotificationEvent | null = null;
+    let deliveryLogs: any[] = [];
+
+    if (evaluation.isDeviating) {
+      dispatchedEvent = {
+        id: `CORR-DEV-${Date.now()}`,
+        category: 'RISK_ALERT',
+        severity: evaluation.severity,
+        title: `XAU/USD × DXY 30D Correlation Deviation (|Δr| ${evaluation.absoluteDeviation.toFixed(2)} > ${threshold.toFixed(2)})`,
+        message: evaluation.summary,
+        timestamp: new Date().toISOString(),
+        isCriticalStateChange: true,
+        metadata: {
+          pairLabel: evaluation.pairLabel,
+          rolling30dCorrelation: evaluation.rolling30dCorrelation,
+          historicalNorm: evaluation.historicalNorm,
+          signedDeviation: evaluation.signedDeviation,
+          absoluteDeviation: evaluation.absoluteDeviation,
+          deviationThreshold: evaluation.deviationThreshold,
+          deviationDirection: evaluation.deviationDirection,
+          stateTransition: true,
+        },
+      };
+      deliveryLogs = await canonicalNotificationService.dispatch(dispatchedEvent);
+    }
+
+    res.json({
+      success: true,
+      evaluation,
+      dispatched: Boolean(dispatchedEvent),
+      dispatchedEvent,
+      deliveryLogs,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: redactSensitiveLogValue(String(err?.message || err)) });
+  }
+});
+
+app.post('/api/alerts/yield-correlation-breakout', async (req, res) => {
+  if (!applySensitiveRateLimit(req, res)) return;
+  try {
+    const {
+      simulateBreakout = false,
+      correlationThreshold = 0.5,
+      overrideRollingCorr,
+    } = req.body || {};
+    const threshold =
+      Number.isFinite(Number(correlationThreshold))
+        ? Math.max(-0.95, Math.min(0.99, Number(correlationThreshold)))
+        : 0.5;
+
+    const allQuotes = await canonicalMarketDataRouter.getAllQuotes();
+    const xauQuote = allQuotes.XAUUSD;
+    const dailyCandles = generateCandleHistory('1D', 60, xauQuote?.mid || 3898.9);
+
+    const evaluation = evaluateXauYieldCorrelationBreakoutAlert(allQuotes, dailyCandles, {
+      correlationThreshold: threshold,
+      overrideRolling30dCorr: Number.isFinite(Number(overrideRollingCorr))
+        ? Number(overrideRollingCorr)
+        : simulateBreakout
+        ? 0.62
+        : undefined,
+    });
+
+    let dispatchedEvent: NotificationEvent | null = null;
+    let deliveryLogs: any[] = [];
+
+    if (evaluation.isBrokenAbove) {
+      dispatchedEvent = {
+        id: `YIELD-CORR-${Date.now()}`,
+        category: 'RISK_ALERT',
+        severity: evaluation.severity,
+        title: `XAU/USD × 10Y Yield Risk-On/Off Regime Shift (r=${evaluation.rolling30dCorrelation >= 0 ? '+' : ''}${evaluation.rolling30dCorrelation.toFixed(2)} > ${threshold.toFixed(2)})`,
+        message: evaluation.summary,
+        timestamp: new Date().toISOString(),
+        isCriticalStateChange: true,
+        metadata: {
+          pairLabel: evaluation.pairLabel,
+          rolling30dCorrelation: evaluation.rolling30dCorrelation,
+          correlationThreshold: evaluation.correlationThreshold,
+          historicalNorm: evaluation.historicalNorm,
+          shiftFromHistoricalNorm: evaluation.shiftFromHistoricalNorm,
+          riskRegimeSignal: evaluation.riskRegimeSignal,
+          stateTransition: true,
+        },
+      };
+      deliveryLogs = await canonicalNotificationService.dispatch(dispatchedEvent);
+    }
+
+    res.json({
+      success: true,
+      evaluation,
+      dispatched: Boolean(dispatchedEvent),
+      dispatchedEvent,
+      deliveryLogs,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: redactSensitiveLogValue(String(err?.message || err)) });
+  }
+});
+
+app.post('/api/alerts/rsi-threshold', async (req, res) => {
+  if (!applySensitiveRateLimit(req, res)) return;
+  try {
+    const {
+      ruleId = 'RSI-CUSTOM-API',
+      ruleName,
+      period = 14,
+      operator = 'CROSS_ABOVE',
+      threshold = 70,
+      timeframe = '1D',
+      simulateDirection,
+      overridePreviousRsi,
+      overrideCurrentRsi,
+    } = req.body || {};
+
+    const safePeriod = Number.isFinite(Number(period)) ? Math.max(2, Math.min(50, Math.round(Number(period)))) : 14;
+    const safeThreshold = Number.isFinite(Number(threshold)) ? Math.max(1, Math.min(99, Number(threshold))) : 70;
+    const validOps: RsiConditionOperator[] = ['CROSS_ABOVE', 'CROSS_BELOW', 'ABOVE', 'BELOW'];
+    const safeOperator: RsiConditionOperator = validOps.includes(operator) ? operator : 'CROSS_ABOVE';
+    const safeTimeframe: Timeframe = ['1m', '5m', '15m', '30m', '1h', '4h', '1D', '1W', '1M'].includes(String(timeframe))
+      ? (timeframe as Timeframe)
+      : '1D';
+
+    const xauQuote = await canonicalMarketDataRouter.getQuote('XAUUSD');
+    const candles = generateCandleHistory(safeTimeframe, 80, xauQuote.mid || 3898.9);
+
+    let overrideRsiPair: { previousRsi: number; currentRsi: number } | undefined;
+    if (Number.isFinite(Number(overridePreviousRsi)) && Number.isFinite(Number(overrideCurrentRsi))) {
+      overrideRsiPair = {
+        previousRsi: Number(overridePreviousRsi),
+        currentRsi: Number(overrideCurrentRsi),
+      };
+    } else if (simulateDirection === 'OVERBOUGHT') {
+      overrideRsiPair = {
+        previousRsi: Math.max(5, safeThreshold - 3.4),
+        currentRsi: Math.min(98, safeThreshold + 2.8),
+      };
+    } else if (simulateDirection === 'OVERSOLD') {
+      overrideRsiPair = {
+        previousRsi: Math.min(95, safeThreshold + 3.2),
+        currentRsi: Math.max(2, safeThreshold - 2.6),
+      };
+    }
+
+    const customRule: CustomRsiAlertConfig = {
+      id: String(ruleId || 'RSI-CUSTOM-API'),
+      name: String(ruleName || `XAU/USD (${safeTimeframe}) RSI(${safePeriod}) ${safeOperator} ${safeThreshold}`),
+      period: safePeriod,
+      operator: safeOperator,
+      threshold: safeThreshold,
+      timeframe: safeTimeframe,
+      isActive: true,
+      createdAt: new Date().toISOString(),
+    };
+
+    const evaluation = evaluateCustomRsiAlerts(candles, [customRule], safeTimeframe, {
+      primaryPeriod: safePeriod,
+      overrideRsiPair,
+    });
+
+    const primaryEval = evaluation.ruleEvaluations[0];
+    let dispatchedEvent: NotificationEvent | null = null;
+    let deliveryLogs: any[] = [];
+
+    if (primaryEval?.isTriggered) {
+      dispatchedEvent = {
+        id: `RSI-ALERT-${Date.now()}`,
+        category: 'RISK_ALERT',
+        severity: primaryEval.severity,
+        title: `XAU/USD (${safeTimeframe}) RSI(${safePeriod}) Triggered (${primaryEval.currentRsi.toFixed(1)})`,
+        message: primaryEval.summary,
+        timestamp: new Date().toISOString(),
+        isCriticalStateChange: true,
+        metadata: {
+          instrumentId: 'XAUUSD',
+          timeframe: safeTimeframe,
+          period: safePeriod,
+          operator: safeOperator,
+          threshold: safeThreshold,
+          previousRsi: primaryEval.previousRsi,
+          currentRsi: primaryEval.currentRsi,
+          crossedOnLatestBar: primaryEval.crossedOnLatestBar,
+          stateTransition: true,
+        },
+      };
+      deliveryLogs = await canonicalNotificationService.dispatch(dispatchedEvent);
+    }
+
+    res.json({
+      success: true,
+      evaluation,
+      dispatched: Boolean(dispatchedEvent),
+      dispatchedEvent,
+      deliveryLogs,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: redactSensitiveLogValue(String(err?.message || err)) });
+  }
+});
+
+app.post('/api/alerts/gsci-correlation', async (req, res) => {
+  if (!applySensitiveRateLimit(req, res)) return;
+  try {
+    const {
+      simulateRegime,
+      commodityThreshold = 0.5,
+      monetaryThreshold = 0.2,
+      alertMode = 'ANY_SHIFT',
+      overrideRollingCorr,
+      overrideMonetaryMagnitude,
+    } = req.body || {};
+
+    const safeCommodityThresh = Number.isFinite(Number(commodityThreshold))
+      ? Math.max(0.2, Math.min(0.95, Number(commodityThreshold)))
+      : 0.5;
+    const safeMonetaryThresh = Number.isFinite(Number(monetaryThreshold))
+      ? Math.max(-0.5, Math.min(0.45, Number(monetaryThreshold)))
+      : 0.2;
+    const safeMode: GsciAlertMode =
+      alertMode === 'COMMODITY_SURGE' || alertMode === 'MONETARY_DECOUPLING' || alertMode === 'ANY_SHIFT'
+        ? alertMode
+        : 'ANY_SHIFT';
+
+    const allQuotes = await canonicalMarketDataRouter.getAllQuotes();
+    const xauQuote = allQuotes.XAUUSD;
+    const dailyCandles = generateCandleHistory('1D', 60, xauQuote?.mid || 3898.9);
+
+    const resolvedOverrideCorr = Number.isFinite(Number(overrideRollingCorr))
+      ? Number(overrideRollingCorr)
+      : simulateRegime === 'COMMODITY_DRIVEN'
+      ? 0.74
+      : simulateRegime === 'MONETARY_DRIVEN'
+      ? 0.08
+      : undefined;
+
+    const evaluation = evaluateXauGsciCorrelationAlert(allQuotes, dailyCandles, {
+      commodityThreshold: safeCommodityThresh,
+      monetaryThreshold: safeMonetaryThresh,
+      alertMode: safeMode,
+      overrideRolling30dCorr: resolvedOverrideCorr,
+      overrideMonetaryMagnitude: Number.isFinite(Number(overrideMonetaryMagnitude))
+        ? Number(overrideMonetaryMagnitude)
+        : undefined,
+    });
+
+    let dispatchedEvent: NotificationEvent | null = null;
+    let deliveryLogs: any[] = [];
+
+    if (evaluation.isTriggered) {
+      dispatchedEvent = {
+        id: `GSCI-CORR-${Date.now()}`,
+        category: 'RISK_ALERT',
+        severity: evaluation.severity,
+        title: `S&P GSCI Driver Alert: ${evaluation.driverRegime === 'GENERAL_COMMODITIES' ? 'General Commodities' : 'Monetary Factors'} (r=${evaluation.rolling30dGsciCorrelation >= 0 ? '+' : ''}${evaluation.rolling30dGsciCorrelation.toFixed(2)})`,
+        message: evaluation.summary,
+        timestamp: new Date().toISOString(),
+        isCriticalStateChange: true,
+        metadata: {
+          pairLabel: evaluation.pairLabel,
+          rolling30dGsciCorrelation: evaluation.rolling30dGsciCorrelation,
+          historicalNorm5Y: evaluation.historicalNorm5Y,
+          driverRegime: evaluation.driverRegime,
+          commodityDriverSharePct: evaluation.commodityDriverSharePct,
+          monetaryDriverSharePct: evaluation.monetaryDriverSharePct,
+          rolling30dMonetaryMagnitude: evaluation.rolling30dMonetaryMagnitude,
+          gsciSpotIndex: evaluation.gsciSpotIndex,
+          stateTransition: true,
+        },
+      };
+      deliveryLogs = await canonicalNotificationService.dispatch(dispatchedEvent);
+    }
+
+    res.json({
+      success: true,
+      evaluation,
+      dispatched: Boolean(dispatchedEvent),
+      dispatchedEvent,
+      deliveryLogs,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: redactSensitiveLogValue(String(err?.message || err)) });
+  }
+});
+
+// -------------------------------------------------------------
+// STRATEGY ALERT SUBSCRIPTIONS & LIVE ENTRY DISPATCH
+// -------------------------------------------------------------
+
+const strategyAlertSubscriptionsStore = new Map<string, Record<string, StrategyAlertSubscription>>();
+
+app.get('/api/alerts/strategy-subscriptions', requireServerRole('PRO'), (req: any, res) => {
+  const userId = req.authUserId || 'usr_demo_trader';
+  const subscriptions = strategyAlertSubscriptionsStore.get(userId) || {};
+  res.json({
+    success: true,
+    userId,
+    subscriptions,
+  });
+});
+
+app.post('/api/alerts/strategy-subscriptions', requireServerRole('PRO'), (req: any, res) => {
+  if (!applySensitiveRateLimit(req, res)) return;
+  const userId = req.authUserId || 'usr_demo_trader';
+  const { strategyId, enabled, subscriptions: batchSubscriptions } = req.body || {};
+
+  const current = { ...(strategyAlertSubscriptionsStore.get(userId) || {}) };
+
+  if (batchSubscriptions && typeof batchSubscriptions === 'object' && !Array.isArray(batchSubscriptions)) {
+    for (const [id, entry] of Object.entries(batchSubscriptions as Record<string, any>)) {
+      if (typeof id === 'string' && entry && typeof entry.enabled === 'boolean') {
+        current[id] = {
+          strategyId: id,
+          enabled: entry.enabled,
+          subscribedAt: typeof entry.subscribedAt === 'string' ? entry.subscribedAt : new Date().toISOString(),
+          lastTriggeredAt: typeof entry.lastTriggeredAt === 'string' ? entry.lastTriggeredAt : current[id]?.lastTriggeredAt,
+          lastTriggeredDirection: entry.lastTriggeredDirection === 'BUY' || entry.lastTriggeredDirection === 'SELL'
+            ? entry.lastTriggeredDirection
+            : current[id]?.lastTriggeredDirection,
+          lastTriggerPrice: typeof entry.lastTriggerPrice === 'number' ? entry.lastTriggerPrice : current[id]?.lastTriggerPrice,
+        };
+      }
+    }
+  } else if (typeof strategyId === 'string' && strategyId.trim() && typeof enabled === 'boolean') {
+    const cleanId = strategyId.trim();
+    const existing = current[cleanId];
+    current[cleanId] = {
+      strategyId: cleanId,
+      enabled,
+      subscribedAt: existing?.subscribedAt || new Date().toISOString(),
+      lastTriggeredAt: existing?.lastTriggeredAt,
+      lastTriggeredDirection: existing?.lastTriggeredDirection,
+      lastTriggerPrice: existing?.lastTriggerPrice,
+    };
+  } else {
+    res.status(400).json({
+      success: false,
+      error: 'Provide { strategyId, enabled: boolean } or { subscriptions } map.',
+    });
+    return;
+  }
+
+  strategyAlertSubscriptionsStore.set(userId, current);
+  res.json({
+    success: true,
+    userId,
+    subscriptions: current,
+  });
+});
+
+app.post('/api/alerts/strategy-trigger', requireServerRole('PRO'), async (req: any, res) => {
+  if (!applySensitiveRateLimit(req, res)) return;
+  try {
+    const userId = req.authUserId || 'usr_demo_trader';
+    const {
+      strategyId,
+      instrumentId = 'XAUUSD',
+      currentMid,
+      simulateEntryMatch = false,
+      indicatorOverrides,
+    } = req.body || {};
+
+    if (typeof strategyId !== 'string' || !strategyId.trim()) {
+      res.status(400).json({ success: false, error: 'Missing required strategyId.' });
+      return;
+    }
+
+    const safeInstrumentId = String(instrumentId || 'XAUUSD') as InstrumentId;
+    const allQuotes = await canonicalMarketDataRouter.getAllQuotes();
+    const activeQuote = allQuotes[safeInstrumentId] || allQuotes.XAUUSD;
+    const resolvedMid = Number.isFinite(Number(currentMid)) && Number(currentMid) > 0
+      ? Number(currentMid)
+      : activeQuote?.mid || 3950.0;
+
+    const strategies = getQuantitativeStrategies(resolvedMid);
+    const strategy = strategies.find((s) => s.id === strategyId.trim());
+    if (!strategy) {
+      res.status(404).json({ success: false, error: `Unknown quantitative strategy: ${strategyId}` });
+      return;
+    }
+
+    const candles = generateCandleHistory('1D', 120, resolvedMid);
+    let evalSnapshot = generateIndicatorSnapshot(candles);
+    let evalCandles = candles;
+    let evalSpread = activeQuote?.spreadPips ?? 22;
+
+    if (simulateEntryMatch) {
+      const last = candles[candles.length - 1];
+      const baseClose = resolvedMid;
+      // Align simulated live indicators deterministically so the chosen strategy's entry criteria fire cleanly
+      evalSnapshot = {
+        ...evalSnapshot,
+        ema9: Number((baseClose * 0.997).toFixed(2)),
+        ema21: Number((baseClose * 0.992).toFixed(2)),
+        ema50: Number((baseClose * 0.985).toFixed(2)),
+        sma50: Number((baseClose * 1.035).toFixed(2)),
+        sma200: Number((baseClose * 0.95).toFixed(2)),
+        rsi14: strategy.id === 'STRAT-04-RANGE-TRADING' ? 29.5 : strategy.id === 'STRAT-05-REVERSAL-DIVERGENCE' ? 30.0 : 56.5,
+        macd: { ...evalSnapshot.macd, histogram: 2.4 },
+        atr14: Number((baseClose * 0.005).toFixed(2)),
+        bollingerBands: {
+          upper: Number((baseClose * 1.014).toFixed(2)),
+          middle: Number((baseClose * 0.992).toFixed(2)),
+          lower: Number((baseClose * 0.999).toFixed(2)),
+          bandwidth: strategy.id === 'STRAT-04-RANGE-TRADING' ? 2.4 : 2.9,
+        },
+        supertrend: { value: Number((baseClose * 0.986).toFixed(2)), direction: 'BULLISH' },
+      };
+      evalCandles = [
+        ...candles.slice(0, -1),
+        {
+          ...last,
+          open: Number((baseClose * 0.993).toFixed(2)),
+          high: Number((baseClose * 1.006).toFixed(2)),
+          low: Number((baseClose * 0.991).toFixed(2)),
+          close: baseClose,
+          volume: Math.round((last?.volume || 15000) * 2.1),
+        },
+      ];
+      evalSpread = 18;
+    } else if (indicatorOverrides && typeof indicatorOverrides === 'object') {
+      evalSnapshot = { ...evalSnapshot, ...indicatorOverrides };
+    }
+
+    const evaluation = evaluateStrategyEntryCriteria(strategy, {
+      currentMid: resolvedMid,
+      instrumentId: safeInstrumentId,
+      candles: evalCandles,
+      indicators: evalSnapshot,
+      quote: activeQuote,
+      spreadPips: evalSpread,
+      tipsRealYieldPct: allQuotes.US_TIPS10Y?.mid,
+    });
+
+    let dispatchedEvent: NotificationEvent | null = null;
+    let deliveryLogs: any[] = [];
+
+    if (evaluation.criteriaMet && (evaluation.direction === 'BUY' || evaluation.direction === 'SELL')) {
+      const userSubs = { ...(strategyAlertSubscriptionsStore.get(userId) || {}) };
+      if (userSubs[strategy.id]) {
+        userSubs[strategy.id] = {
+          ...userSubs[strategy.id],
+          lastTriggeredAt: evaluation.evaluatedAt,
+          lastTriggeredDirection: evaluation.direction,
+          lastTriggerPrice: evaluation.triggerPrice,
+        };
+        strategyAlertSubscriptionsStore.set(userId, userSubs);
+      }
+
+      dispatchedEvent = {
+        id: `STRAT-ALERT-${Date.now()}`,
+        category: 'ADVISORY',
+        severity: 'SUCCESS',
+        title: `Strategy Alert: ${strategy.name} (${evaluation.direction} ${safeInstrumentId})`,
+        message: evaluation.summary,
+        timestamp: evaluation.evaluatedAt,
+        isCriticalStateChange: true,
+        metadata: {
+          strategyId: strategy.id,
+          instrumentId: safeInstrumentId,
+          direction: evaluation.direction,
+          triggerPrice: evaluation.triggerPrice,
+          stopLossPrice: evaluation.stopLossPrice,
+          target1Price: evaluation.target1Price,
+          matchedConditionsCount: evaluation.matchedConditionsCount,
+          totalConditionsCount: evaluation.totalConditionsCount,
+          stateTransition: true,
+        },
+      };
+      deliveryLogs = await canonicalNotificationService.dispatch(dispatchedEvent);
+    }
+
+    res.json({
+      success: true,
+      evaluation,
+      dispatched: Boolean(dispatchedEvent),
+      dispatchedEvent,
+      deliveryLogs,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: redactSensitiveLogValue(String(err?.message || err)) });
+  }
+});
+
+// -------------------------------------------------------------
+// TRADE OPEN / CLOSE LIFECYCLE ALERTS (PER-USER ISOLATED)
+// -------------------------------------------------------------
+
+interface ServerTradeLifecycleAlert {
+  id: string;
+  userId: string;
+  eventType: 'TRADE_OPENED' | 'TRADE_CLOSED';
+  positionId: string;
+  instrumentId: string;
+  direction: 'BUY' | 'SELL';
+  lots: number;
+  entryPrice: number;
+  exitPrice?: number;
+  stopLoss?: number;
+  takeProfit?: number;
+  realizedPnl?: number;
+  status: string;
+  triggerSource: string;
+  reason?: string;
+  timestamp: string;
+}
+
+const tradeLifecycleAlertsStore = new Map<string, ServerTradeLifecycleAlert[]>();
+
+app.get('/api/alerts/trade-lifecycle', requireServerRole('FREE'), (req: any, res) => {
+  const userId = req.authUserId || 'usr_demo_trader';
+  const alerts = tradeLifecycleAlertsStore.get(userId) || [];
+  res.json({
+    success: true,
+    userId,
+    alerts,
+  });
+});
+
+app.post('/api/alerts/trade-lifecycle', requireServerRole('FREE'), async (req: any, res) => {
+  if (!applySensitiveRateLimit(req, res)) return;
+  try {
+    const userId = req.authUserId || 'usr_demo_trader';
+    const {
+      eventType,
+      positionId,
+      instrumentId = 'XAUUSD',
+      direction,
+      lots,
+      entryPrice,
+      exitPrice,
+      stopLoss,
+      takeProfit,
+      realizedPnl,
+      status = 'OPEN',
+      triggerSource = 'MANUAL',
+      reason,
+    } = req.body || {};
+
+    if (eventType !== 'TRADE_OPENED' && eventType !== 'TRADE_CLOSED') {
+      res.status(400).json({ success: false, error: 'eventType must be TRADE_OPENED or TRADE_CLOSED.' });
+      return;
+    }
+    if (!positionId || (direction !== 'BUY' && direction !== 'SELL')) {
+      res.status(400).json({ success: false, error: 'Missing required positionId or direction.' });
+      return;
+    }
+
+    const numericEntry = Number(entryPrice);
+    const numericLots = Number(lots);
+    const numericExit = exitPrice !== undefined ? Number(exitPrice) : undefined;
+    const numericPnl = realizedPnl !== undefined ? Number(realizedPnl) : undefined;
+    const timestamp = new Date().toISOString();
+
+    const record: ServerTradeLifecycleAlert = {
+      id: `TLA-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`,
+      userId,
+      eventType,
+      positionId: String(positionId),
+      instrumentId: String(instrumentId),
+      direction,
+      lots: Number.isFinite(numericLots) ? numericLots : 1,
+      entryPrice: Number.isFinite(numericEntry) ? numericEntry : 0,
+      exitPrice: Number.isFinite(numericExit) ? numericExit : undefined,
+      stopLoss: Number.isFinite(Number(stopLoss)) ? Number(stopLoss) : undefined,
+      takeProfit: Number.isFinite(Number(takeProfit)) ? Number(takeProfit) : undefined,
+      realizedPnl: Number.isFinite(numericPnl) ? numericPnl : undefined,
+      status: String(status),
+      triggerSource: String(triggerSource),
+      reason: typeof reason === 'string' ? reason : undefined,
+      timestamp,
+    };
+
+    const existing = tradeLifecycleAlertsStore.get(userId) || [];
+    tradeLifecycleAlertsStore.set(userId, [record, ...existing].slice(0, 100));
+
+    const decimals = String(instrumentId).includes('10Y') ? 3 : 2;
+    const pnlSign = (numericPnl ?? 0) >= 0 ? '+$' : '-$';
+    const pnlFormatted = `${pnlSign}${Math.abs(numericPnl ?? 0).toFixed(2)}`;
+    const title =
+      eventType === 'TRADE_OPENED'
+        ? `Paper Trade Opened: ${direction} ${instrumentId} (${record.lots} lots)`
+        : `Paper Trade Closed (${pnlFormatted}): ${direction} ${instrumentId}`;
+    const message =
+      eventType === 'TRADE_OPENED'
+        ? `Opened ${direction} ${record.lots} lots ${instrumentId} @ $${record.entryPrice.toFixed(decimals)} (SL $${(
+            record.stopLoss ?? 0
+          ).toFixed(decimals)}, TP $${(record.takeProfit ?? 0).toFixed(decimals)}) via ${record.triggerSource}.`
+        : `Closed ${direction} ${record.lots} lots ${instrumentId} @ $${(
+            record.exitPrice ?? record.entryPrice
+          ).toFixed(decimals)} · Realized P&L ${pnlFormatted}${record.reason ? ` · ${record.reason}` : ''}.`;
+
+    const notificationEvent: NotificationEvent = {
+      id: record.id,
+      category: 'LIFECYCLE',
+      severity: eventType === 'TRADE_CLOSED' && (numericPnl ?? 0) < 0 ? 'WARNING' : 'SUCCESS',
+      title,
+      message,
+      timestamp,
+      isCriticalStateChange: true,
+      metadata: {
+        userId,
+        eventType,
+        positionId: record.positionId,
+        instrumentId: record.instrumentId,
+        direction: record.direction,
+        lots: record.lots,
+        entryPrice: record.entryPrice,
+        exitPrice: record.exitPrice,
+        realizedPnl: record.realizedPnl,
+        triggerSource: record.triggerSource,
+        stateTransition: true,
+      },
+    };
+
+    const deliveryLogs = await canonicalNotificationService.dispatch(notificationEvent);
+
+    res.json({
+      success: true,
+      userId,
+      alert: record,
+      deliveryLogs,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: redactSensitiveLogValue(String(err?.message || err)) });
+  }
+});
+
 // -------------------------------------------------------------
 // DOMAIN SERVICES (MACRO, STRATEGIES, RISK, ADVISORY)
 // -------------------------------------------------------------
@@ -731,6 +1808,156 @@ app.get('/api/macro/data', async (req, res) => {
     releases: MACRO_ECONOMIC_RELEASES,
     studies: HISTORICAL_EVENT_STUDIES,
     analogs,
+  });
+});
+
+app.get('/api/macro/correlations', async (req, res) => {
+  const rawWindow = String(req.query.window || '30D').toUpperCase();
+  const windowHorizon: CorrelationWindow =
+    rawWindow === '14D' || rawWindow === '90D' ? (rawWindow as CorrelationWindow) : '30D';
+  const quotes = await canonicalMarketDataRouter.getAllQuotes();
+  const xauMid = quotes.XAUUSD?.mid || 3898.9;
+  const candles = generateCandleHistory('1D', 120, xauMid);
+  const report = calculateMacroCorrelationMatrix(quotes, candles, windowHorizon);
+  const rolling30d = calculateRolling30DayCorrelationSeries(quotes, candles, 45);
+  res.json({ success: true, report, rolling30d });
+});
+
+app.get('/api/macro/cot-gold', async (req, res) => {
+  const rawScope = String(req.query.scope || 'MANAGED_MONEY').toUpperCase();
+  const scope: InstitutionalSentimentScope =
+    rawScope === 'COMPOSITE_SMART_MONEY' ? 'COMPOSITE_SMART_MONEY' : 'MANAGED_MONEY';
+
+  let sourceMode: 'CFTC_LIVE_API' | 'CFTC_CURATED_BASELINE' = 'CFTC_CURATED_BASELINE';
+  let weeklyHistory: CotWeeklySnapshot[] = GOLD_COT_WEEKLY_HISTORY;
+  let reportOverride: Partial<typeof CANONICAL_COT_REPORTS.GOLD> & { otherReportablesNet?: number } = {
+    ...CANONICAL_COT_REPORTS.GOLD,
+    otherReportablesNet: GOLD_COT_WEEKLY_HISTORY[GOLD_COT_WEEKLY_HISTORY.length - 1]?.otherReportablesNet ?? 36950,
+  };
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2500);
+    const cftcRes = await fetch(
+      'https://publicreporting.cftc.gov/resource/6dca-aqww.json?cftc_contract_market_code=088691&$order=report_date_as_yyyy_mm_dd%20DESC&$limit=8',
+      { signal: controller.signal }
+    );
+    clearTimeout(timer);
+
+    if (cftcRes.ok) {
+      const rows = (await cftcRes.json()) as Array<Record<string, any>>;
+      const validRows = Array.isArray(rows)
+        ? rows.filter(
+            (r) =>
+              r &&
+              r.noncomm_positions_long_all !== undefined &&
+              r.noncomm_positions_short_all !== undefined &&
+              r.open_interest_all !== undefined
+          )
+        : [];
+
+      if (validRows.length > 0) {
+        const chronological: CotWeeklySnapshot[] = validRows
+          .slice()
+          .reverse()
+          .map((row) => {
+            const longs = Number(row.noncomm_positions_long_all) || 0;
+            const shorts = Number(row.noncomm_positions_short_all) || 0;
+            const commLongs = Number(row.comm_positions_long_all) || 0;
+            const commShorts = Number(row.comm_positions_short_all) || 0;
+            const oi = Math.max(1, Number(row.open_interest_all) || 0);
+            const otherLongs = Number(row.nonrept_positions_long_all) || 0;
+            const otherShorts = Number(row.nonrept_positions_short_all) || 0;
+            return {
+              reportDate: String(row.report_date_as_yyyy_mm_dd || '').slice(0, 10) || CANONICAL_COT_REPORTS.GOLD.reportDate,
+              managedMoneyLongs: longs,
+              managedMoneyShorts: shorts,
+              managedMoneyNet: longs - shorts,
+              commercialHedgersNet: commLongs - commShorts,
+              otherReportablesNet: otherLongs - otherShorts,
+              totalOpenInterest: oi,
+            };
+          });
+
+        const latest = chronological[chronological.length - 1];
+        const prev = chronological.length > 1 ? chronological[chronological.length - 2] : latest;
+        const netChange1W = latest.managedMoneyNet - prev.managedMoneyNet;
+        const oiChange1W = latest.totalOpenInterest - prev.totalOpenInterest;
+        const netPctOi = (latest.managedMoneyNet / Math.max(1, latest.totalOpenInterest)) * 100;
+        const estimatedPercentile52W = Math.max(5, Math.min(98, Math.round(50 + (netPctOi / 45) * 38)));
+
+        sourceMode = 'CFTC_LIVE_API';
+        weeklyHistory = chronological;
+        reportOverride = {
+          reportDate: latest.reportDate,
+          managedMoneyLongs: latest.managedMoneyLongs,
+          managedMoneyShorts: latest.managedMoneyShorts,
+          managedMoneyNet: latest.managedMoneyNet,
+          commercialHedgersNet: latest.commercialHedgersNet,
+          totalOpenInterest: latest.totalOpenInterest,
+          otherReportablesNet: latest.otherReportablesNet,
+          netChange1W,
+          oiChange1W,
+          percentile52W: estimatedPercentile52W,
+        };
+      }
+    }
+  } catch {
+    // Cleanly retain CFTC_CURATED_BASELINE fallback when offline or rate-limited
+  }
+
+  const sentiment = calculateGoldCotInstitutionalSentiment(reportOverride, {
+    scope,
+    sourceMode,
+    weeklyHistory,
+  });
+
+  res.json({
+    success: true,
+    sourceMode,
+    reportOverride,
+    weeklyHistory,
+    sentiment,
+  });
+});
+
+app.get('/api/council/institutional-queue', async (req, res) => {
+  const rawCommodity = String(req.query.commodity || 'GOLD').toUpperCase();
+  const commodity: CommodityType =
+    rawCommodity === 'SILVER' || rawCommodity === 'WTI_OIL' || rawCommodity === 'BRENT_OIL'
+      ? (rawCommodity as CommodityType)
+      : 'GOLD';
+
+  const rawVenue = String(req.query.venue || 'ALL').toUpperCase();
+  const venueFilter: BrokerVenueFilter =
+    rawVenue === 'CME_GLOBEX' ||
+    rawVenue === 'LMAX_PRIME' ||
+    rawVenue === 'SAXO_PRIME' ||
+    rawVenue === 'CURRENEX_ECN'
+      ? (rawVenue as BrokerVenueFilter)
+      : 'ALL';
+
+  const rawOrder = String(req.query.orderType || 'ALL').toUpperCase();
+  const orderFilter: QueueOrderTypeFilter =
+    rawOrder === 'LIMIT' || rawOrder === 'STOP' ? (rawOrder as QueueOrderTypeFilter) : 'ALL';
+
+  const quotes = await canonicalMarketDataRouter.getAllQuotes();
+  const primaryId = getPrimaryInstrumentForCommodity(commodity).id;
+  const anchorPrice = quotes[primaryId]?.mid || 3898.9;
+  const candles = generateCandleHistory('1D', 60, anchorPrice);
+
+  const queue = calculateInstitutionalOrderQueue({
+    commodity,
+    quotes,
+    candles,
+    venueFilter,
+    orderFilter,
+    sourceMode: 'SERVER_LIVE_SNAPSHOT',
+  });
+
+  res.json({
+    success: true,
+    queue,
   });
 });
 
@@ -753,6 +1980,105 @@ app.post('/api/strategies/backtest', async (req, res) => {
   res.json(result);
 });
 
+app.post('/api/strategies/execution-simulator', async (req, res) => {
+  const {
+    strategyId,
+    timeframe,
+    initialCapital,
+    spreadPips,
+    commission,
+    executionMode,
+    feeTier,
+    sessionRegime,
+    orderSizeOverrideLots,
+    depthMultiplier,
+  } = req.body ?? {};
+
+  const tf = (timeframe as Timeframe) || '1h';
+  const q = await canonicalMarketDataRouter.getQuote('XAUUSD');
+  const candles = generateCandleHistory(tf, 180, q.mid);
+  const resolvedStrategyId = typeof strategyId === 'string' && strategyId ? strategyId : 'STRAT-01-MACRO-TREND';
+  const resolvedInitialCapital = Number.isFinite(Number(initialCapital)) && Number(initialCapital) > 0
+    ? Number(initialCapital)
+    : 100000;
+  const resolvedSpreadPips = Number.isFinite(Number(spreadPips)) && Number(spreadPips) >= 0
+    ? Number(spreadPips)
+    : 28;
+  const resolvedCommission = Number.isFinite(Number(commission)) && Number(commission) >= 0
+    ? Number(commission)
+    : 7.0;
+
+  const backtestResult = runBacktestSimulation(
+    resolvedStrategyId,
+    candles,
+    resolvedInitialCapital,
+    resolvedSpreadPips,
+    resolvedCommission,
+    tf
+  );
+
+  const validMode: L2ExecutionMode = ['MARKET_SWEEP', 'TWAP_SLICED', 'LIMIT_PASSIVE'].includes(executionMode)
+    ? executionMode
+    : 'MARKET_SWEEP';
+  const validFeeTier: L2FeeTier = ['PRIME_INSTITUTIONAL', 'ECN_PRO', 'RETAIL_STANDARD'].includes(feeTier)
+    ? feeTier
+    : 'ECN_PRO';
+  const validSession: L2LiquiditySession = [
+    'LONDON_NY_OVERLAP',
+    'NEW_YORK_AFTERNOON',
+    'ASIAN_SESSION',
+    'EVENT_SHOCK',
+  ].includes(sessionRegime)
+    ? sessionRegime
+    : 'LONDON_NY_OVERLAP';
+
+  const parsedLotOverride =
+    orderSizeOverrideLots !== null &&
+    orderSizeOverrideLots !== undefined &&
+    Number.isFinite(Number(orderSizeOverrideLots)) &&
+    Number(orderSizeOverrideLots) > 0
+      ? Number(orderSizeOverrideLots)
+      : null;
+
+  const parsedDepthMult =
+    Number.isFinite(Number(depthMultiplier)) && Number(depthMultiplier) > 0
+      ? Number(depthMultiplier)
+      : 1.0;
+
+  const executionReport = simulateBacktestL2Execution(backtestResult, {
+    executionMode: validMode,
+    feeTier: validFeeTier,
+    sessionRegime: validSession,
+    midPriceOverride: q.mid,
+    orderSizeOverrideLots: parsedLotOverride,
+    depthMultiplier: parsedDepthMult,
+  });
+
+  const l2OrderBook = buildInstitutionalL2OrderBook({
+    midPrice: q.mid,
+    sessionRegime: validSession,
+    depthMultiplier: parsedDepthMult,
+    orderLotsToConsume: executionReport.evaluatedLotSize,
+    consumeSide: 'BUY',
+  });
+
+  res.json({
+    success: true,
+    backtestSummary: {
+      strategyId: backtestResult.strategyId,
+      strategyName: backtestResult.strategyName,
+      timeframe: backtestResult.timeframe,
+      initialCapital: backtestResult.initialCapital,
+      totalTrades: backtestResult.totalTrades,
+      winRatePct: backtestResult.winRatePct,
+      netProfit: backtestResult.netProfit,
+      profitFactor: backtestResult.profitFactor,
+    },
+    l2OrderBook,
+    executionReport,
+  });
+});
+
 app.post('/api/cfd/calculate', (req, res) => {
   const { accountEquity, riskPercent, entryPrice, stopLossPrice, target1Price, currentSpreadPips } = req.body;
   const result = calculateCFDRisk({
@@ -766,6 +2092,43 @@ app.post('/api/cfd/calculate', (req, res) => {
   res.json(result);
 });
 
+async function getLiveAdvisoryContext(instrumentId: InstrumentId, quote: any) {
+  let shortCandles = generateCandleHistory('15m', 90, quote.mid);
+  let shortIndicators = generateIndicatorSnapshot(shortCandles);
+  let swingCandles = generateCandleHistory('1h', 120, quote.mid);
+  let swingIndicators = generateIndicatorSnapshot(swingCandles);
+
+  try {
+    const [shortHist, swingHist] = await Promise.all([
+      fetchRealHistoricalChartData(instrumentId, '5D', undefined, undefined, undefined, '15m', quote.mid),
+      fetchRealHistoricalChartData(instrumentId, '3M', undefined, undefined, undefined, '1D', quote.mid),
+    ]);
+    if (shortHist?.visibleCandles?.length >= 20) {
+      shortCandles = shortHist.visibleCandles;
+      shortIndicators = shortHist.currentIndicatorSnapshot;
+    }
+    if (swingHist?.visibleCandles?.length >= 20) {
+      swingCandles = swingHist.visibleCandles;
+      swingIndicators = swingHist.currentIndicatorSnapshot;
+    }
+  } catch {
+    // Retain local candle fallback if upstream history fetch is unavailable
+  }
+
+  return {
+    candles: shortCandles,
+    indicators: shortIndicators,
+    quote,
+    horizonContexts: {
+      INTRADAY: { candles: shortCandles, indicators: shortIndicators },
+      CFD: { candles: shortCandles, indicators: shortIndicators },
+      SHORT_TERM: { candles: shortCandles, indicators: shortIndicators },
+      SWING: { candles: swingCandles, indicators: swingIndicators },
+      LONG_TERM: { candles: swingCandles, indicators: swingIndicators },
+    },
+  };
+}
+
 app.get('/api/advisory/plans', async (req, res) => {
   const instrumentId = (req.query.instrumentId as InstrumentId) || 'XAUUSD';
   let q: any;
@@ -775,21 +2138,35 @@ app.get('/api/advisory/plans', async (req, res) => {
     const quotes = await canonicalMarketDataRouter.getAllQuotes();
     q = quotes[instrumentId] || quotes.XAUUSD;
   }
-  const plans = generateTradePlans(q);
+  const advisoryCtx = await getLiveAdvisoryContext(instrumentId, q);
+  const plans = generateTradePlans(q, advisoryCtx);
+  const rationales = (Object.keys(plans) as AdvisoryHorizon[]).reduce((acc, h) => {
+    acc[h] = buildStrategyBiasRationale(q, h, advisoryCtx, plans[h]);
+    return acc;
+  }, {} as Record<AdvisoryHorizon, StrategyBiasRationale>);
+  const dynamicRegime = classifyMarketRegimeFromSeries(advisoryCtx.horizonContexts.SWING.candles, q.quality);
   res.json({
     primaryInstrument: instrumentId,
     currentQuote: q,
     plans,
-    regime: CURRENT_MARKET_REGIME,
+    rationales,
+    regime: {
+      ...CURRENT_MARKET_REGIME,
+      currentRegime: dynamicRegime.regime === 'UNKNOWN' ? CURRENT_MARKET_REGIME.currentRegime : dynamicRegime.regime,
+      confidencePct: dynamicRegime.confidencePct || CURRENT_MARKET_REGIME.confidencePct,
+      summary: dynamicRegime.rationale,
+      updatedAt: dynamicRegime.classifiedAtUtc,
+    },
   });
 });
 
 app.get('/api/advisory/agents', async (req, res) => {
   const instrumentId = (req.query.instrumentId as InstrumentId) || 'XAUUSD';
   const q = await canonicalMarketDataRouter.getQuote(instrumentId);
+  const advisoryCtx = await getLiveAdvisoryContext(instrumentId, q);
   res.json({
-    agents: getSpecialistAgents(q.mid),
-    evidence: getEvidenceRegistry(q.mid),
+    agents: getSpecialistAgents(q.mid, advisoryCtx),
+    evidence: getEvidenceRegistry(q.mid, advisoryCtx),
   });
 });
 
@@ -1215,11 +2592,34 @@ app.get('/api/decision/scan', async (req, res) => {
     const horizon = (req.query.horizon as any) || 'SWING';
     const instrumentId = req.query.instrumentId as InstrumentId | undefined;
     const allQuotes = await canonicalMarketDataRouter.getAllQuotes();
+    const fetchCandlesSafe = async (id: InstrumentId, mid: number) => {
+      try {
+        const tf: Timeframe = horizon === 'INTRADAY' || horizon === 'CFD' ? '15m' : horizon === 'LONG_TERM' ? '1D' : '1h';
+        const period: HistoricalRangePeriod = horizon === 'INTRADAY' || horizon === 'CFD' ? '5D' : horizon === 'LONG_TERM' ? '1Y' : '1M';
+        const hist = await fetchRealHistoricalChartData(id, period, undefined, undefined, undefined, tf, mid);
+        if (hist?.visibleCandles?.length >= 20) return hist.visibleCandles;
+      } catch {
+        // fallback below
+      }
+      return generateCandleHistory('1h', 80, mid);
+    };
+
     if (instrumentId && allQuotes[instrumentId]) {
-      const decision = evaluateInstrumentDecision(instrumentId, allQuotes[instrumentId], allQuotes, { horizon });
+      const candles = await fetchCandlesSafe(instrumentId, allQuotes[instrumentId].mid);
+      const decision = evaluateInstrumentDecision(instrumentId, allQuotes[instrumentId], allQuotes, { horizon, candles });
       return res.json({ success: true, singleDecision: decision });
     }
-    const scanner = runOpportunityScanner(allQuotes, horizon);
+
+    const scanTargets: InstrumentId[] = ['XAUUSD', 'XAGUSD', 'WTI_CRUDE', 'BRENT_CRUDE'];
+    const candlePairs = await Promise.all(
+      scanTargets.map(async (id) => {
+        const q = allQuotes[id];
+        if (!q) return [id, undefined] as const;
+        return [id, await fetchCandlesSafe(id, q.mid)] as const;
+      })
+    );
+    const candlesByInstrument = Object.fromEntries(candlePairs) as Partial<Record<InstrumentId, any>>;
+    const scanner = runOpportunityScanner(allQuotes, horizon, candlesByInstrument);
     res.json({ success: true, scanner });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
@@ -1265,6 +2665,74 @@ app.get('/api/reports/institutional', async (req, res) => {
   }
 });
 
+app.post('/api/reports/export-pdf', async (req, res) => {
+  try {
+    const {
+      instrumentId: rawInstrument,
+      reportType: rawReportType,
+      reportTitle: rawTitle,
+      timeframe: rawTimeframe,
+      chartSnapshotDataUrl,
+    } = req.body ?? {};
+
+    const instrumentId = (typeof rawInstrument === 'string' && rawInstrument ? rawInstrument : 'XAUUSD') as InstrumentId;
+    const reportType: InstitutionalReportCategory = [
+      'DAILY_INTELLIGENCE',
+      'INTRADAY_BRIEF',
+      'SWING_OUTLOOK',
+      'CFD_RISK_REPORT',
+    ].includes(rawReportType)
+      ? rawReportType
+      : 'DAILY_INTELLIGENCE';
+
+    const allQuotes = await canonicalMarketDataRouter.getAllQuotes();
+    const quote = allQuotes[instrumentId] || allQuotes.XAUUSD;
+    const tf: Timeframe =
+      rawTimeframe ||
+      (reportType === 'INTRADAY_BRIEF' ? '15m' : reportType === 'SWING_OUTLOOK' ? '4h' : '1D');
+    const candles = generateCandleHistory(tf, 120, quote.mid);
+    const indicators = generateIndicatorSnapshot(candles);
+    const plans = generateTradePlans(quote, { candles, indicators, quote });
+
+    const activePlan =
+      reportType === 'INTRADAY_BRIEF'
+        ? plans.INTRADAY || plans.SWING
+        : reportType === 'CFD_RISK_REPORT'
+        ? plans.CFD || plans.SWING
+        : plans.SWING || plans.INTRADAY;
+
+    const defaultTitle =
+      reportType === 'INTRADAY_BRIEF'
+        ? 'Intraday Session Advisor & Order Flow Intelligence'
+        : reportType === 'SWING_OUTLOOK'
+        ? 'Swing Trading Horizon & Multi-Day Macro Confluence'
+        : reportType === 'CFD_RISK_REPORT'
+        ? 'Institutional CFD Margin & Position Risk Allocation'
+        : 'Daily Gold Market Intelligence & Advisory Brief';
+
+    const artifact = buildInstitutionalPdfReport({
+      reportTitle: typeof rawTitle === 'string' && rawTitle.trim() ? rawTitle.trim() : defaultTitle,
+      reportType,
+      quote,
+      regime: CURRENT_MARKET_REGIME,
+      indicators,
+      activePlan,
+      candles,
+      timeframe: tf,
+      chartSnapshotDataUrl: typeof chartSnapshotDataUrl === 'string' ? chartSnapshotDataUrl : null,
+    });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${artifact.filename}"`);
+    res.setHeader('X-Aurum-Snapshot-Hash', artifact.snapshotHash);
+    res.setHeader('X-Aurum-Report-Ref', artifact.reportRefId);
+    res.setHeader('X-Aurum-Page-Count', String(artifact.pageCount));
+    return res.status(200).send(Buffer.from(artifact.pdfBytes));
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || 'PDF generation failed' });
+  }
+});
+
 // Phase 9: Portfolio Multi-Scenario Stress Matrix API (§12)
 app.post('/api/portfolio/stress-test', (req, res) => {
   try {
@@ -1297,17 +2765,23 @@ async function loadTenantPaperJournal(userId: string, seedGoldMid = 3950): Promi
   if (postgresPaperJournalRepo) {
     const dbPositions = await postgresPaperJournalRepo.loadPositions(userId);
     if (dbPositions.length > 0) return dbPositions;
-    const seeds = getInitialSeedPositions(seedGoldMid);
-    const nowIso = new Date().toISOString();
-    for (const s of seeds) {
-      await postgresPaperJournalRepo.upsertPosition({ ...s, id: `${userId}:${s.id}`, userId, updatedAt: nowIso });
+    if (isDemoPersonaUserId(userId) && !seededDemoPostgresUsers.has(userId)) {
+      seededDemoPostgresUsers.add(userId);
+      const seeds = getInitialSeedPositions(seedGoldMid);
+      const nowIso = new Date().toISOString();
+      for (const s of seeds) {
+        await postgresPaperJournalRepo.upsertPosition({ ...s, id: `${userId}:${s.id}`, userId, updatedAt: nowIso });
+      }
+      return postgresPaperJournalRepo.loadPositions(userId);
     }
-    return postgresPaperJournalRepo.loadPositions(userId);
+    return [];
   }
 
   const store = readPaperJournalStore(JOURNAL_STORE_PATH);
   if (!Array.isArray(store.byUser[userId])) {
-    store.byUser[userId] = getInitialSeedPositions(seedGoldMid);
+    // Only explicit demo personas auto-seed baseline institutional sample trades;
+    // all newly registered / real users start with a clean empty portfolio ([]).
+    store.byUser[userId] = isDemoPersonaUserId(userId) ? getInitialSeedPositions(seedGoldMid) : [];
     writePaperJournalStore(JOURNAL_STORE_PATH, store);
   }
   return store.byUser[userId];
@@ -1328,6 +2802,7 @@ app.get('/api/portfolio/journal', requireServerRole('FREE'), async (req, res) =>
     res.json({
       success: true,
       userId,
+      isDemoPersona: isDemoPersonaUserId(userId),
       persistenceMode,
       isSimulatedPaperOnly: true,
       positions,
@@ -1341,7 +2816,18 @@ app.post('/api/portfolio/journal', requireServerRole('FREE'), async (req, res) =
   try {
     const authed = req as express.Request & { authUserId?: string };
     const userId = authed.authUserId || 'usr_demo_trader';
-    const { action = 'OPEN', position, positionId, closePrice } = req.body || {};
+    const {
+      action = 'OPEN',
+      position,
+      positionSnapshot,
+      positionSnapshots,
+      positionId,
+      positionIds,
+      thresholdPct,
+      closePrice,
+      closePrices,
+      closeNote,
+    } = req.body || {};
 
     let goldMid = 3950;
     try {
@@ -1350,6 +2836,34 @@ app.post('/api/portfolio/journal', requireServerRole('FREE'), async (req, res) =
     } catch {
       // fallback
     }
+
+    const resolveInstrumentExitPrice = async (
+      instrumentId: InstrumentId,
+      explicitClose?: unknown,
+      fallbackPrice?: number
+    ): Promise<number> => {
+      const numericExplicit = Number(explicitClose);
+      if (Number.isFinite(numericExplicit) && numericExplicit > 0) {
+        return Number(numericExplicit.toFixed(4));
+      }
+      const mapExplicit =
+        closePrices && typeof closePrices === 'object'
+          ? Number((closePrices as Record<string, unknown>)[instrumentId])
+          : NaN;
+      if (Number.isFinite(mapExplicit) && mapExplicit > 0) {
+        return Number(mapExplicit.toFixed(4));
+      }
+      try {
+        const q = await canonicalMarketDataRouter.getQuote(instrumentId);
+        if (q && Number.isFinite(q.mid) && q.mid > 0) {
+          return Number(q.mid.toFixed(4));
+        }
+      } catch {
+        // fallback below
+      }
+      if (instrumentId === 'XAUUSD') return goldMid;
+      return fallbackPrice && fallbackPrice > 0 ? fallbackPrice : goldMid;
+    };
 
     const currentPositions = await loadTenantPaperJournal(userId, goldMid);
 
@@ -1368,9 +2882,11 @@ app.post('/api/portfolio/journal', requireServerRole('FREE'), async (req, res) =
       }
 
       const nowIso = new Date().toISOString();
+      const rawAdverse = Number(raw.adverseExtremePrice);
       const newPos: PaperPosition = {
         id: String(raw.id || `POS-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`),
         tradePlanId: String(raw.tradePlanId || 'MANUAL-PAPER'),
+        advisoryHorizon: raw.advisoryHorizon,
         instrumentId: (raw.instrumentId as InstrumentId) || 'XAUUSD',
         direction,
         lots: Number(lots.toFixed(4)),
@@ -1378,6 +2894,7 @@ app.post('/api/portfolio/journal', requireServerRole('FREE'), async (req, res) =
         currentPrice: Number(entryPrice.toFixed(4)),
         stopLoss: Number.isFinite(stopLoss) ? Number(stopLoss.toFixed(4)) : entryPrice,
         takeProfit: Number.isFinite(takeProfit) ? Number(takeProfit.toFixed(4)) : entryPrice,
+        adverseExtremePrice: Number.isFinite(rawAdverse) && rawAdverse > 0 ? Number(rawAdverse.toFixed(4)) : Number(entryPrice.toFixed(4)),
         unrealizedPnl: 0,
         realizedPnl: 0,
         openTime: raw.openTime || nowIso,
@@ -1393,7 +2910,8 @@ app.post('/api/portfolio/journal', requireServerRole('FREE'), async (req, res) =
       }
 
       const store = readPaperJournalStore(JOURNAL_STORE_PATH);
-      const updated = [newPos, ...(store.byUser[userId] || currentPositions)].slice(0, 200);
+      const baseList = (store.byUser[userId] || currentPositions).filter((p) => p.id !== newPos.id);
+      const updated = [newPos, ...baseList].slice(0, 200);
       store.byUser[userId] = updated;
       writePaperJournalStore(JOURNAL_STORE_PATH, store);
       return res.status(201).json({ success: true, persistenceMode, isSimulatedPaperOnly: true, position: newPos, positions: updated });
@@ -1401,23 +2919,80 @@ app.post('/api/portfolio/journal', requireServerRole('FREE'), async (req, res) =
 
     if (action === 'CLOSE') {
       const targetId = String(positionId || '');
-      const existing = currentPositions.find((p) => p.id === targetId);
+      let existing = currentPositions.find((p) => p.id === targetId);
+      let insertMissing = false;
+
+      if (!existing && positionSnapshot && typeof positionSnapshot === 'object') {
+        const snap = positionSnapshot as Partial<PaperPosition>;
+        const snapDir = snap.direction === 'SELL' ? 'SELL' : snap.direction === 'BUY' ? 'BUY' : null;
+        const snapLots = Number(snap.lots);
+        const snapEntry = Number(snap.entryPrice);
+        if (snapDir && Number.isFinite(snapLots) && snapLots > 0 && Number.isFinite(snapEntry) && snapEntry > 0) {
+          existing = {
+            id: targetId || String(snap.id || `POS-${Date.now()}`),
+            tradePlanId: String(snap.tradePlanId || 'MANUAL-PAPER'),
+            advisoryHorizon: snap.advisoryHorizon,
+            instrumentId: (snap.instrumentId as InstrumentId) || 'XAUUSD',
+            direction: snapDir,
+            lots: Number(snapLots.toFixed(4)),
+            entryPrice: Number(snapEntry.toFixed(4)),
+            currentPrice: Number(snap.currentPrice || snapEntry),
+            stopLoss: Number.isFinite(Number(snap.stopLoss)) ? Number(snap.stopLoss) : snapEntry,
+            takeProfit: Number.isFinite(Number(snap.takeProfit)) ? Number(snap.takeProfit) : snapEntry,
+            adverseExtremePrice: Number.isFinite(Number(snap.adverseExtremePrice))
+              ? Number(snap.adverseExtremePrice)
+              : snapEntry,
+            unrealizedPnl: 0,
+            realizedPnl: 0,
+            openTime: String(snap.openTime || new Date().toISOString()),
+            status: 'OPEN',
+            notes: String(snap.notes || 'Simulated paper position.'),
+          };
+          insertMissing = true;
+        }
+      }
+
       if (!existing) {
         return res.status(404).json({ success: false, error: `Paper position ${targetId} not found.` });
       }
+
       if (existing.status !== 'OPEN') {
-        return res.status(409).json({ success: false, error: `Paper position ${targetId} is already closed.` });
+        return res.json({
+          success: true,
+          alreadyClosed: true,
+          persistenceMode,
+          isSimulatedPaperOnly: true,
+          position: existing,
+          positions: currentPositions,
+        });
       }
 
-      const exitPx = Number.isFinite(Number(closePrice)) && Number(closePrice) > 0 ? Number(closePrice) : goldMid;
+      const exitPx = await resolveInstrumentExitPrice(existing.instrumentId, closePrice, existing.currentPrice);
       const priceDelta = existing.direction === 'SELL' ? existing.entryPrice - exitPx : exitPx - existing.entryPrice;
-      const realizedPnl = Number((priceDelta * existing.lots * 100).toFixed(2));
+      const multiplier = getInstrumentMultiplierForMae(existing.instrumentId);
+      const realizedPnl = Number((priceDelta * existing.lots * multiplier).toFixed(2));
+      const prevExtreme = existing.adverseExtremePrice ?? existing.entryPrice;
+      const updatedExtreme =
+        existing.direction === 'SELL'
+          ? Math.max(prevExtreme, exitPx)
+          : Math.min(prevExtreme, exitPx);
+
+      const sanitizedCloseNote =
+        typeof closeNote === 'string' ? closeNote.trim().slice(0, 240) : '';
+      const nextNotes =
+        sanitizedCloseNote && !String(existing.notes || '').includes(sanitizedCloseNote)
+          ? `${existing.notes ? `${existing.notes} ` : ''}${sanitizedCloseNote}`
+          : existing.notes;
+
       const closedPos: PaperPosition = {
         ...existing,
         currentPrice: exitPx,
+        adverseExtremePrice: Number(updatedExtreme.toFixed(4)),
         unrealizedPnl: 0,
         realizedPnl,
+        closeTime: new Date().toISOString(),
         status: realizedPnl >= 0 ? 'CLOSED_PROFIT' : 'CLOSED_LOSS',
+        notes: nextNotes,
       };
 
       if (postgresPaperJournalRepo) {
@@ -1427,15 +3002,255 @@ app.post('/api/portfolio/journal', requireServerRole('FREE'), async (req, res) =
       }
 
       const store = readPaperJournalStore(JOURNAL_STORE_PATH);
-      const updated = (store.byUser[userId] || currentPositions).map((p) => (p.id === targetId ? closedPos : p));
+      const baseList = store.byUser[userId] || currentPositions;
+      const updated = insertMissing
+        ? [closedPos, ...baseList]
+        : baseList.map((p) => (p.id === existing!.id ? closedPos : p));
       store.byUser[userId] = updated;
       writePaperJournalStore(JOURNAL_STORE_PATH, store);
       return res.json({ success: true, persistenceMode, isSimulatedPaperOnly: true, position: closedPos, positions: updated });
     }
 
-    if (action === 'RESET') {
+    if (action === 'CLOSE_ALL') {
+      const openList = currentPositions.filter((p) => p.status === 'OPEN');
+      if (openList.length === 0) {
+        return res.json({
+          success: true,
+          closedCount: 0,
+          persistenceMode,
+          isSimulatedPaperOnly: true,
+          positions: currentPositions,
+        });
+      }
+
+      const closedById = new Map<string, PaperPosition>();
+      for (const existing of openList) {
+        const exitPx = await resolveInstrumentExitPrice(existing.instrumentId, undefined, existing.currentPrice);
+        const priceDelta = existing.direction === 'SELL' ? existing.entryPrice - exitPx : exitPx - existing.entryPrice;
+        const multiplier = getInstrumentMultiplierForMae(existing.instrumentId);
+        const realizedPnl = Number((priceDelta * existing.lots * multiplier).toFixed(2));
+        const prevExtreme = existing.adverseExtremePrice ?? existing.entryPrice;
+        const updatedExtreme =
+          existing.direction === 'SELL'
+            ? Math.max(prevExtreme, exitPx)
+            : Math.min(prevExtreme, exitPx);
+        const closeIso = new Date().toISOString();
+        closedById.set(existing.id, {
+          ...existing,
+          currentPrice: exitPx,
+          adverseExtremePrice: Number(updatedExtreme.toFixed(4)),
+          unrealizedPnl: 0,
+          realizedPnl,
+          closeTime: closeIso,
+          status: realizedPnl >= 0 ? 'CLOSED_PROFIT' : 'CLOSED_LOSS',
+        });
+      }
+
+      if (postgresPaperJournalRepo) {
+        const nowIso = new Date().toISOString();
+        for (const closedPos of closedById.values()) {
+          await postgresPaperJournalRepo.upsertPosition({ ...closedPos, userId, updatedAt: nowIso });
+        }
+        const reloaded = await postgresPaperJournalRepo.loadPositions(userId);
+        return res.json({
+          success: true,
+          closedCount: closedById.size,
+          persistenceMode,
+          isSimulatedPaperOnly: true,
+          positions: reloaded,
+        });
+      }
+
+      const store = readPaperJournalStore(JOURNAL_STORE_PATH);
+      const updated = (store.byUser[userId] || currentPositions).map((p) => closedById.get(p.id) || p);
+      store.byUser[userId] = updated;
+      writePaperJournalStore(JOURNAL_STORE_PATH, store);
+      return res.json({
+        success: true,
+        closedCount: closedById.size,
+        persistenceMode,
+        isSimulatedPaperOnly: true,
+        positions: updated,
+      });
+    }
+
+    if (action === 'SYNC_CLEANUP') {
+      const numericThreshold = Number(thresholdPct);
+      const effectiveThresholdPct =
+        Number.isFinite(numericThreshold) && numericThreshold >= 0.1 && numericThreshold <= 50
+          ? numericThreshold
+          : DEFAULT_GHOST_DEVIATION_THRESHOLD_PCT;
+
+      const requestedIds = Array.isArray(positionIds)
+        ? new Set(positionIds.map((id) => String(id)))
+        : null;
+
+      // Reconcile any locally-opened active ghost positions passed via positionSnapshots
+      const existingById = new Set(currentPositions.map((p) => p.id));
+      const missingSnapshots: PaperPosition[] = [];
+      if (Array.isArray(positionSnapshots)) {
+        for (const rawSnap of positionSnapshots) {
+          if (!rawSnap || typeof rawSnap !== 'object') continue;
+          const snap = rawSnap as Partial<PaperPosition>;
+          const snapId = String(snap.id || '');
+          const snapDir = snap.direction === 'SELL' ? 'SELL' : snap.direction === 'BUY' ? 'BUY' : null;
+          const snapLots = Number(snap.lots);
+          const snapEntry = Number(snap.entryPrice);
+          if (
+            !snapId ||
+            existingById.has(snapId) ||
+            !snapDir ||
+            !Number.isFinite(snapLots) ||
+            snapLots <= 0 ||
+            !Number.isFinite(snapEntry) ||
+            snapEntry <= 0
+          ) {
+            continue;
+          }
+          existingById.add(snapId);
+          missingSnapshots.push({
+            id: snapId,
+            tradePlanId: String(snap.tradePlanId || 'MANUAL-PAPER'),
+            advisoryHorizon: snap.advisoryHorizon,
+            instrumentId: (snap.instrumentId as InstrumentId) || 'XAUUSD',
+            direction: snapDir,
+            lots: Number(snapLots.toFixed(4)),
+            entryPrice: Number(snapEntry.toFixed(4)),
+            currentPrice: Number(snap.currentPrice || snapEntry),
+            stopLoss: Number.isFinite(Number(snap.stopLoss)) ? Number(snap.stopLoss) : snapEntry,
+            takeProfit: Number.isFinite(Number(snap.takeProfit)) ? Number(snap.takeProfit) : snapEntry,
+            adverseExtremePrice: Number.isFinite(Number(snap.adverseExtremePrice))
+              ? Number(snap.adverseExtremePrice)
+              : snapEntry,
+            unrealizedPnl: 0,
+            realizedPnl: 0,
+            openTime: String(snap.openTime || new Date().toISOString()),
+            status: 'OPEN',
+            notes: String(snap.notes || 'Simulated paper position.'),
+          });
+        }
+      }
+
+      const workingPositions = [...missingSnapshots, ...currentPositions];
+      const openList = workingPositions.filter(
+        (p) => p.status === 'OPEN' && (!requestedIds || requestedIds.size === 0 || requestedIds.has(p.id))
+      );
+
+      const closedById = new Map<string, PaperPosition>();
+      const closedSummaries: Array<{
+        positionId: string;
+        instrumentId: InstrumentId;
+        entryPrice: number;
+        exitPrice: number;
+        deviationPct: number;
+        realizedPnl: number;
+      }> = [];
+      let skippedCount = 0;
+
+      for (const existing of openList) {
+        const exitPx = await resolveInstrumentExitPrice(existing.instrumentId, undefined, existing.currentPrice);
+        const deviationPct = computeEntryPriceDeviationPct(existing.entryPrice, exitPx);
+        if (deviationPct < effectiveThresholdPct) {
+          skippedCount += 1;
+          continue;
+        }
+
+        const priceDelta = existing.direction === 'SELL' ? existing.entryPrice - exitPx : exitPx - existing.entryPrice;
+        const multiplier = getInstrumentMultiplierForMae(existing.instrumentId);
+        const realizedPnl = Number((priceDelta * existing.lots * multiplier).toFixed(2));
+        const prevExtreme = existing.adverseExtremePrice ?? existing.entryPrice;
+        const updatedExtreme =
+          existing.direction === 'SELL' ? Math.max(prevExtreme, exitPx) : Math.min(prevExtreme, exitPx);
+        const auditTag = `[Auto-Sync Cleanup: Force-closed at $${exitPx.toFixed(2)} (${deviationPct.toFixed(2)}% deviation from $${existing.entryPrice.toFixed(2)} entry since ${existing.openTime.slice(0, 10)}).]`;
+        const nextNotes = existing.notes?.includes('Auto-Sync Cleanup:')
+          ? existing.notes
+          : `${existing.notes ? `${existing.notes} ` : ''}${auditTag}`;
+
+        const closedPos: PaperPosition = {
+          ...existing,
+          currentPrice: exitPx,
+          adverseExtremePrice: Number(updatedExtreme.toFixed(4)),
+          unrealizedPnl: 0,
+          realizedPnl,
+          closeTime: new Date().toISOString(),
+          status: realizedPnl >= 0 ? 'CLOSED_PROFIT' : 'CLOSED_LOSS',
+          notes: nextNotes,
+        };
+        closedById.set(existing.id, closedPos);
+        closedSummaries.push({
+          positionId: existing.id,
+          instrumentId: existing.instrumentId,
+          entryPrice: existing.entryPrice,
+          exitPrice: exitPx,
+          deviationPct,
+          realizedPnl,
+        });
+      }
+
+      if (closedById.size === 0) {
+        return res.json({
+          success: true,
+          cleanedCount: 0,
+          skippedCount,
+          thresholdPct: effectiveThresholdPct,
+          closedSummaries: [],
+          persistenceMode,
+          isSimulatedPaperOnly: true,
+          positions: currentPositions,
+        });
+      }
+
+      if (postgresPaperJournalRepo) {
+        const nowIso = new Date().toISOString();
+        for (const closedPos of closedById.values()) {
+          await postgresPaperJournalRepo.upsertPosition({ ...closedPos, userId, updatedAt: nowIso });
+        }
+        const reloaded = await postgresPaperJournalRepo.loadPositions(userId);
+        return res.json({
+          success: true,
+          cleanedCount: closedById.size,
+          skippedCount,
+          thresholdPct: effectiveThresholdPct,
+          closedSummaries,
+          persistenceMode,
+          isSimulatedPaperOnly: true,
+          positions: reloaded,
+        });
+      }
+
+      const store = readPaperJournalStore(JOURNAL_STORE_PATH);
+      const baseList = [...missingSnapshots, ...(store.byUser[userId] || currentPositions)];
+      const updated = baseList.map((p) => closedById.get(p.id) || p);
+      store.byUser[userId] = updated;
+      writePaperJournalStore(JOURNAL_STORE_PATH, store);
+      return res.json({
+        success: true,
+        cleanedCount: closedById.size,
+        skippedCount,
+        thresholdPct: effectiveThresholdPct,
+        closedSummaries,
+        persistenceMode,
+        isSimulatedPaperOnly: true,
+        positions: updated,
+      });
+    }
+
+    if (action === 'CLEAR') {
+      if (postgresPaperJournalRepo) {
+        seededDemoPostgresUsers.add(userId);
+        await postgresPaperJournalRepo.resetUserPositions(userId);
+        return res.json({ success: true, persistenceMode, isSimulatedPaperOnly: true, positions: [] });
+      }
+      const store = readPaperJournalStore(JOURNAL_STORE_PATH);
+      store.byUser[userId] = [];
+      writePaperJournalStore(JOURNAL_STORE_PATH, store);
+      return res.json({ success: true, persistenceMode, isSimulatedPaperOnly: true, positions: [] });
+    }
+
+    if (action === 'RESET' || action === 'SEED_DEMO') {
       const seeds = getInitialSeedPositions(goldMid);
       if (postgresPaperJournalRepo) {
+        seededDemoPostgresUsers.add(userId);
         await postgresPaperJournalRepo.resetUserPositions(userId);
         const nowIso = new Date().toISOString();
         for (const s of seeds) {
@@ -1713,7 +3528,8 @@ Be concise, mathematically precise, cite levels accurately, and always emphasize
 
 app.post('/api/billing/webhook', (req: any, res) => {
   if (!applySensitiveRateLimit(req, res)) return;
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  const rawWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  const webhookSecret = isTemplatePlaceholderValue(rawWebhookSecret) ? undefined : rawWebhookSecret;
   const requireStrictHmac = Boolean(webhookSecret) || process.env.NODE_ENV === 'production';
 
   if (requireStrictHmac) {
@@ -1802,14 +3618,14 @@ app.get('/api/billing/ledger/:userId', requireServerRole('FREE'), (req, res) => 
 // Public safe runtime auth configuration notice for browser client
 app.get('/api/auth/session-config', (_req, res) => {
   const sandboxModeEnabled = isSandboxPersonasEnabled();
-  const oidcConfigured = Boolean(process.env.OAUTH_JWKS_URI);
+  const oidcConfigured = !isTemplatePlaceholderValue(process.env.OAUTH_JWKS_URI);
   res.json({
     sandboxModeEnabled,
     oidcConfigured,
     persistenceMode,
-    oidcAuthorizationEndpoint: process.env.OAUTH_AUTHORIZATION_ENDPOINT || null,
-    oidcClientId: process.env.OAUTH_CLIENT_ID || null,
-    oidcRedirectUri: process.env.OAUTH_REDIRECT_URI || null,
+    oidcAuthorizationEndpoint: oidcConfigured ? process.env.OAUTH_AUTHORIZATION_ENDPOINT || null : null,
+    oidcClientId: oidcConfigured ? process.env.OAUTH_CLIENT_ID || null : null,
+    oidcRedirectUri: oidcConfigured ? process.env.OAUTH_REDIRECT_URI || null : null,
     authProviderMode: oidcConfigured && !sandboxModeEnabled
       ? 'OIDC_PKCE_JWKS'
       : sandboxModeEnabled

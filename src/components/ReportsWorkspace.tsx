@@ -17,10 +17,12 @@ import {
   IndicatorSnapshot,
   MarketRegime,
   Quote,
+  Timeframe,
   TradePlan,
 } from '../domain/types';
 import {
   FileText,
+  FileDown,
   Printer,
   Copy,
   Check,
@@ -46,6 +48,7 @@ import {
 import { toPng } from 'html-to-image';
 import { generateInstitutionalReport } from '../services/institutionalReportEngine';
 import { getSessionBearerToken } from '../services/authService';
+import { buildInstitutionalPdfReport } from '../services/pdfReportExporter';
 
 interface ReportsWorkspaceProps {
   quote: Quote;
@@ -54,6 +57,7 @@ interface ReportsWorkspaceProps {
   tradePlans: Record<string, TradePlan>;
   candles?: Candle[];
   currentCommodity?: CommodityType;
+  timeframe?: Timeframe;
 }
 
 export type ReportType =
@@ -164,7 +168,10 @@ const AdvisoryChartEvidence: React.FC<{
   ];
 
   return (
-    <div className="bg-slate-950 border border-slate-800 rounded-lg p-3.5 sm:p-4 space-y-3 shadow-md">
+    <div
+      id={isFacebookCard ? 'advisory-chart-evidence-fb' : 'advisory-chart-evidence-card'}
+      className="bg-slate-950 border border-slate-800 rounded-lg p-3.5 sm:p-4 space-y-3 shadow-md"
+    >
       {/* Evidence Subheader */}
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 pb-2.5">
         <div className="flex items-center gap-2">
@@ -181,7 +188,7 @@ const AdvisoryChartEvidence: React.FC<{
           </div>
         </div>
 
-        <div className="flex items-center gap-2 font-mono text-xs">
+        <div className="flex items-center gap-2 font-mono text-xs tabular-nums">
           <span className="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 font-bold">
             {plan.direction}
           </span>
@@ -197,7 +204,7 @@ const AdvisoryChartEvidence: React.FC<{
       {/* SVG Candlestick & Level Overlay Chart */}
       <div className="relative w-full overflow-hidden rounded bg-slate-900/60 border border-slate-800/80">
         <svg
-          id="advisory-chart-svg"
+          id={isFacebookCard ? 'advisory-chart-svg-fb' : 'advisory-chart-svg'}
           viewBox={`0 0 ${svgWidth} ${svgHeight}`}
           className="w-full h-auto block select-none"
           style={{ minHeight: '220px', maxHeight: '310px' }}
@@ -471,12 +478,21 @@ export const ReportsWorkspace: React.FC<ReportsWorkspaceProps> = ({
   tradePlans,
   candles,
   currentCommodity = 'GOLD',
+  timeframe = '1D',
 }) => {
   const [selectedReportType, setSelectedReportType] = useState<ReportType>('DAILY_INTELLIGENCE');
   const [copied, setCopied] = useState(false);
   const [isPrinting, setIsPrinting] = useState(false);
   const [isCapturingImage, setIsCapturingImage] = useState(false);
   const [imageSavedNotice, setImageSavedNotice] = useState(false);
+  const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
+  const [pdfExportResult, setPdfExportResult] = useState<{
+    filename: string;
+    byteLength: number;
+    pageCount: number;
+    snapshotHash: string;
+  } | null>(null);
+  const [pdfExportError, setPdfExportError] = useState<string | null>(null);
   const reportCardRef = useRef<HTMLDivElement>(null);
   const fbCardRef = useRef<HTMLDivElement>(null);
 
@@ -571,7 +587,7 @@ Verified Signature: SHA256:${Math.random().toString(16).slice(2, 10)}${Math.rand
 Gold maintains strong structural momentum backed by sovereign central bank reserve accumulation and lower Treasury real yields. 
 
 🎯 VALIDATED ${activePlan.horizon} TRADE LEVELS:
-• Direction: ${activePlan.direction === 'BUY' ? '🟢 BUY / LONG' : '🔴 SELL / SHORT'}
+• Direction: ${activePlan.direction === 'BUY' ? '🟢 BUY / LONG' : activePlan.direction === 'SELL' ? '🔴 SELL / SHORT' : '🟡 HOLD / NEUTRAL'}
 • Entry Corridor: $${activePlan.entryZoneMin} - $${activePlan.entryZoneMax}
 • Invalidation Stop Loss: $${activePlan.stopLossPrice}
 • Take Profit Target 1: $${activePlan.target1Price}
@@ -579,9 +595,9 @@ Gold maintains strong structural momentum backed by sovereign central bank reser
 • Net Reward:Risk: 1:${activePlan.rewardToRiskRatio}
 
 📊 TECHNICAL EVIDENCE:
-• RSI(14): ${indicators.rsi14} (Bullish Momentum Expansion)
+• RSI(14): ${indicators.rsi14} (${indicators.rsi14 >= 55 ? 'Bullish Momentum' : indicators.rsi14 <= 45 ? 'Bearish Momentum' : 'Neutral Consolidation'})
 • Supertrend: ${indicators.supertrend.direction} ($${indicators.supertrend.value})
-• EMA Stack: Price > 50 EMA ($${indicators.ema50}) > 200 EMA ($${indicators.ema200})
+• EMA Stack: 50 EMA ($${indicators.ema50}) / 200 EMA ($${indicators.ema200})
 
 ⚠️ RISK NOTICE:
 Strict invalidation at $${activePlan.stopLossPrice}. Trading gold involves risk; always apply prudent risk management.
@@ -892,6 +908,77 @@ Strict invalidation at $${activePlan.stopLossPrice}. Trading gold involves risk;
   };
 
   /**
+   * Generates a formatted institutional PDF research document aggregating the current
+   * chart snapshot, active trade plan levels, technical indicators, and macro regime.
+   */
+  const handleGeneratePdfReport = async () => {
+    setIsGeneratingPdf(true);
+    setPdfExportError(null);
+    setPdfExportResult(null);
+
+    try {
+      let chartSnapshotDataUrl: string | null = null;
+      const chartContainer =
+        document.getElementById('advisory-chart-evidence-card') ||
+        document.getElementById('advisory-chart-svg');
+
+      if (chartContainer) {
+        try {
+          if (document.fonts?.ready) {
+            await document.fonts.ready;
+          }
+          chartSnapshotDataUrl = await toPng(chartContainer, {
+            pixelRatio: 2,
+            backgroundColor: '#020617',
+            cacheBust: true,
+            skipFonts: true,
+            fontEmbedCSS: '',
+          });
+        } catch {
+          // buildInstitutionalPdfReport renders a deterministic vector candlestick chart snapshot when DOM PNG capture is unavailable
+          chartSnapshotDataUrl = null;
+        }
+      }
+
+      const artifact = buildInstitutionalPdfReport({
+        reportTitle,
+        reportType: selectedReportType,
+        quote,
+        regime,
+        indicators,
+        activePlan,
+        candles,
+        timeframe,
+        commodity: currentCommodity,
+        chartSnapshotDataUrl,
+      });
+
+      const pdfBlob = new Blob([artifact.pdfBytes as unknown as BlobPart], {
+        type: 'application/pdf',
+      });
+      const blobUrl = URL.createObjectURL(pdfBlob);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = artifact.filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 2500);
+
+      setPdfExportResult({
+        filename: artifact.filename,
+        byteLength: artifact.byteLength,
+        pageCount: artifact.pageCount,
+        snapshotHash: artifact.snapshotHash,
+      });
+    } catch (err: any) {
+      setPdfExportError(err?.message || 'Unable to generate PDF institutional research document.');
+    } finally {
+      setIsGeneratingPdf(false);
+    }
+  };
+
+  /**
    * Dispatches editorial to backend publication API / Facebook GoldVista
    */
   const handlePublishEditorial = async () => {
@@ -957,10 +1044,27 @@ Strict invalidation at $${activePlan.stopLossPrice}. Trading gold involves risk;
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          {/* Generate Institutional PDF Report */}
+          <button
+            type="button"
+            aria-label="Generate PDF Report"
+            onClick={handleGeneratePdfReport}
+            disabled={isGeneratingPdf}
+            className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-bold font-mono text-slate-950 bg-amber-400 hover:bg-amber-300 disabled:opacity-50 rounded transition-colors whitespace-nowrap shrink-0"
+            title="Export institutional PDF research document with chart snapshot, active trade plan, and technical indicators"
+          >
+            {isGeneratingPdf ? (
+              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <FileDown className="w-3.5 h-3.5" />
+            )}
+            <span>{isGeneratingPdf ? 'Compiling PDF...' : 'Generate PDF Report'}</span>
+          </button>
+
           {/* Copy Text */}
           <button
             onClick={handleCopy}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono bg-slate-950 hover:bg-slate-800 text-slate-200 border border-slate-800 rounded transition-colors"
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono bg-slate-950 hover:bg-slate-800 text-slate-200 border border-slate-800 rounded transition-colors whitespace-nowrap shrink-0"
             title="Copy Report Text"
           >
             {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
@@ -971,7 +1075,7 @@ Strict invalidation at $${activePlan.stopLossPrice}. Trading gold involves risk;
           <button
             onClick={handleDownloadImageSnapshot}
             disabled={isCapturingImage}
-            className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-mono bg-slate-950 hover:bg-slate-800 text-sky-300 border border-sky-500/40 hover:border-sky-400 rounded transition-all font-semibold shadow-xs active:scale-95 disabled:opacity-50"
+            className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-mono bg-slate-950 hover:bg-slate-800 text-sky-300 border border-sky-500/40 hover:border-sky-400 rounded transition-all font-semibold shadow-xs active:scale-95 disabled:opacity-50 whitespace-nowrap shrink-0"
             title="Download full Facebook-ready report image (1200px Retina 2x) with GoldVista branding and zero right-side clipping"
           >
             {isCapturingImage ? (
@@ -993,7 +1097,7 @@ Strict invalidation at $${activePlan.stopLossPrice}. Trading gold involves risk;
           {/* Download HTML Doc */}
           <button
             onClick={handleDownloadHtmlBackup}
-            className="flex items-center gap-1 px-2.5 py-1.5 text-xs font-mono bg-slate-950 hover:bg-slate-800 text-slate-400 hover:text-slate-200 border border-slate-800 rounded transition-colors"
+            className="flex items-center gap-1 px-2.5 py-1.5 text-xs font-mono bg-slate-950 hover:bg-slate-800 text-slate-400 hover:text-slate-200 border border-slate-800 rounded transition-colors whitespace-nowrap shrink-0"
             title="Download Standalone HTML Document"
           >
             <Download className="w-3 h-3 text-slate-500" />
@@ -1003,7 +1107,7 @@ Strict invalidation at $${activePlan.stopLossPrice}. Trading gold involves risk;
           {/* Download 12-Section §13.2 Markdown Audit Brief */}
           <button
             onClick={handleDownloadAuditBriefMarkdown}
-            className="flex items-center gap-1 px-2.5 py-1.5 text-xs font-mono bg-slate-950 hover:bg-slate-800 text-emerald-300 border border-emerald-500/30 hover:border-emerald-400 rounded transition-colors"
+            className="flex items-center gap-1 px-2.5 py-1.5 text-xs font-mono bg-slate-950 hover:bg-slate-800 text-emerald-300 border border-emerald-500/30 hover:border-emerald-400 rounded transition-colors whitespace-nowrap shrink-0"
             title="Download §13.2 12-Section Snapshot Audit Brief (.md)"
           >
             <FileText className="w-3 h-3 text-emerald-400" />
@@ -1014,7 +1118,7 @@ Strict invalidation at $${activePlan.stopLossPrice}. Trading gold involves risk;
           <button
             onClick={handlePrint}
             disabled={isPrinting}
-            className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-mono bg-slate-950 hover:bg-slate-800 text-amber-300 border border-amber-500/40 rounded transition-colors font-semibold shadow-xs"
+            className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-mono bg-slate-950 hover:bg-slate-800 text-amber-300 border border-amber-500/40 rounded transition-colors font-semibold shadow-xs whitespace-nowrap shrink-0"
             title="Print or Save as PDF"
           >
             <Printer className="w-3.5 h-3.5 text-amber-400" />
@@ -1024,7 +1128,7 @@ Strict invalidation at $${activePlan.stopLossPrice}. Trading gold involves risk;
           {/* Publish Editorial Button */}
           <button
             onClick={() => setShowPublishModal(true)}
-            className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-bold text-slate-950 bg-gradient-to-r from-amber-400 to-amber-500 hover:from-amber-300 hover:to-amber-400 rounded transition-all shadow-md active:scale-95"
+            className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-bold text-slate-950 bg-slate-100 hover:bg-white rounded transition-colors whitespace-nowrap shrink-0"
             title="Publish Editorial to Facebook Page GoldVista"
           >
             <Share2 className="w-3.5 h-3.5" />
@@ -1032,6 +1136,49 @@ Strict invalidation at $${activePlan.stopLossPrice}. Trading gold involves risk;
           </button>
         </div>
       </div>
+
+      {/* PDF Institutional Research Export Confirmation Banner */}
+      {pdfExportResult && (
+        <div
+          aria-label="PDF Export Confirmation"
+          className="bg-slate-900 border border-emerald-500/40 text-emerald-300 text-xs font-mono tabular-nums px-4 py-2.5 rounded-lg flex flex-wrap items-center justify-between gap-2 max-w-4xl mx-auto"
+        >
+          <div className="flex items-center gap-2">
+            <Check className="w-4 h-4 text-emerald-400 shrink-0" />
+            <span>
+              Institutional PDF exported: <strong className="text-slate-100">{pdfExportResult.filename}</strong>
+              <span className="text-slate-500 mx-2">·</span>
+              {(pdfExportResult.byteLength / 1024).toFixed(1)} KB
+              <span className="text-slate-500 mx-2">·</span>
+              {pdfExportResult.pageCount} {pdfExportResult.pageCount === 1 ? 'page' : 'pages'}
+            </span>
+          </div>
+          <div className="flex items-center gap-3 text-[11px] text-slate-400">
+            <span>SHA-256: {pdfExportResult.snapshotHash.slice(0, 14)}…</span>
+            <button
+              type="button"
+              onClick={() => setPdfExportResult(null)}
+              className="text-slate-400 hover:text-slate-200 whitespace-nowrap shrink-0"
+              aria-label="Dismiss PDF notice"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
+
+      {pdfExportError && (
+        <div className="bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs font-mono px-4 py-2.5 rounded-lg flex items-center justify-between max-w-4xl mx-auto">
+          <span>{pdfExportError}</span>
+          <button
+            type="button"
+            onClick={() => setPdfExportError(null)}
+            className="text-rose-200 hover:text-white whitespace-nowrap shrink-0"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* Snapshot Confirmation Alert banner */}
       {imageSavedNotice && (

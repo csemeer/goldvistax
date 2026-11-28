@@ -5,6 +5,7 @@
  */
 
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import type { Request, Response, NextFunction } from 'express';
 import { EnterpriseBillingEngine } from './src/services/billingWebhookEngine';
 
@@ -95,9 +96,28 @@ const PERSONA_ROLE_MAP: Record<string, ServerRoleTier> = {
   institutional: 'ALPHA',
 };
 
+function loadOrCreateDevSessionSecret(): string {
+  if (process.env.NODE_ENV === 'production') {
+    return crypto.randomBytes(32).toString('hex');
+  }
+  const secretPath = process.env.AURUM_DEV_SECRET_PATH || '/tmp/aurum-dev-session-secret.key';
+  try {
+    if (fs.existsSync(secretPath)) {
+      const existing = fs.readFileSync(secretPath, 'utf8').trim();
+      if (/^[a-f0-9]{32,}$/i.test(existing)) {
+        return existing;
+      }
+    }
+    const generated = crypto.randomBytes(32).toString('hex');
+    fs.writeFileSync(secretPath, generated, { encoding: 'utf8', mode: 0o600 });
+    return generated;
+  } catch {
+    return crypto.createHmac('sha256', 'aurum-ephemeral-dev-seed').update(process.cwd()).digest('hex');
+  }
+}
+
 const RUNTIME_SESSION_SECRET =
-  process.env.AURUM_SESSION_SECRET ||
-  crypto.createHmac('sha256', 'aurum-ephemeral-dev-seed').update(`${process.pid}`).digest('hex');
+  process.env.AURUM_SESSION_SECRET || loadOrCreateDevSessionSecret();
 
 export function isSandboxPersonasEnabled(): boolean {
   if (process.env.NODE_ENV === 'production') {
@@ -231,7 +251,7 @@ export function evaluateServerRoleFromToken(
   return {
     authorized,
     resolvedTier,
-    userId: 'usr_demo_trader',
+    userId: verification.userId || 'usr_demo_trader',
     tokenType: 'UNSIGNED_SANDBOX',
     reason: authorized ? undefined : `Requires ${requiredTier} role; token resolves to ${resolvedTier}.`,
   };
@@ -274,13 +294,97 @@ export class FixedWindowRateLimiter {
 }
 
 /**
- * Redacts tokens, API keys, and signing secrets before emitting diagnostic logs (§14.1).
+ * Redacts tokens, API keys, Telegram bot tokens, and signing secrets before emitting diagnostic logs (§14.1).
  */
 export function redactSensitiveLogValue(input: string): string {
   return input
     .replace(/(Bearer\s+)[A-Za-z0-9\-._~+/]+=*/gi, '$1[REDACTED]')
-    .replace(/(whsec_|sk_live_|sk_test_|AIzaSy|EAAG)[A-Za-z0-9\-_]{6,}/g, '$1[REDACTED]')
+    .replace(/(whsec_|sk_live_|sk_test_|AIzaSy|EAAG|AQ\.)[A-Za-z0-9\-_]{6,}/g, '$1[REDACTED]')
+    .replace(/\b(bot)?(\d{6,}:[A-Za-z0-9_-]{16,})\b/g, '$1[TELEGRAM_BOT_REDACTED]')
     .replace(/("?(?:apiKey|pageAccessToken|secret|token|password)"?\s*:\s*")([^"]+)(")/gi, '$1[REDACTED]$3');
+}
+
+/**
+ * Detects unreplaced `.env.example` placeholder strings so dev/sandbox boots do not treat dummy strings as live infra.
+ */
+export function isTemplatePlaceholderValue(value?: string): boolean {
+  const trimmed = (value || '').trim();
+  if (!trimmed) return true;
+  if (/^(MY_APP_URL|MY_GEMINI_API_KEY|YOUR_|REPLACE_WITH_)/i.test(trimmed)) return true;
+  if (trimmed.includes('your-idp.example.com')) return true;
+  if (trimmed === 'https://discord.com/api/webhooks/...') return true;
+  if (trimmed === 'whsec_YOUR_STRIPE_WEBHOOK_SIGNING_SECRET') return true;
+  return false;
+}
+
+/**
+ * Extracts validated Market Data & Notification startup updates from `process.env`.
+ */
+export function buildEnvHydrationConfigs(env: Record<string, string | undefined>): {
+  marketDataUpdate: {
+    primaryProvider?: string;
+    fallbackProvider?: string;
+    maxStaleSeconds?: number;
+    pollIntervalSeconds?: number;
+  };
+  notificationUpdate: {
+    telegramEnabled?: boolean;
+    telegramBotToken?: string;
+    telegramChatId?: string;
+    webhookEnabled?: boolean;
+    webhookUrl?: string;
+    webhookType?: 'DISCORD' | 'SLACK' | 'GENERIC';
+  };
+} {
+  const marketDataUpdate: {
+    primaryProvider?: string;
+    fallbackProvider?: string;
+    maxStaleSeconds?: number;
+    pollIntervalSeconds?: number;
+  } = {};
+
+  if (!isTemplatePlaceholderValue(env.MARKET_DATA_PRIMARY_PROVIDER)) {
+    marketDataUpdate.primaryProvider = env.MARKET_DATA_PRIMARY_PROVIDER!.trim();
+  }
+  if (!isTemplatePlaceholderValue(env.MARKET_DATA_FALLBACK_PROVIDER)) {
+    marketDataUpdate.fallbackProvider = env.MARKET_DATA_FALLBACK_PROVIDER!.trim();
+  }
+  const staleSec = Number(env.MARKET_DATA_MAX_STALE_SECONDS);
+  if (Number.isFinite(staleSec) && staleSec >= 5) {
+    marketDataUpdate.maxStaleSeconds = staleSec;
+  }
+  const pollSec = Number(env.MARKET_DATA_POLL_INTERVAL_SECONDS);
+  if (Number.isFinite(pollSec) && pollSec >= 5) {
+    marketDataUpdate.pollIntervalSeconds = pollSec;
+  }
+
+  const notificationUpdate: {
+    telegramEnabled?: boolean;
+    telegramBotToken?: string;
+    telegramChatId?: string;
+    webhookEnabled?: boolean;
+    webhookUrl?: string;
+    webhookType?: 'DISCORD' | 'SLACK' | 'GENERIC';
+  } = {};
+
+  if (!isTemplatePlaceholderValue(env.TELEGRAM_BOT_TOKEN) && !isTemplatePlaceholderValue(env.TELEGRAM_CHAT_ID)) {
+    notificationUpdate.telegramBotToken = env.TELEGRAM_BOT_TOKEN!.trim();
+    notificationUpdate.telegramChatId = env.TELEGRAM_CHAT_ID!.trim();
+    notificationUpdate.telegramEnabled = true;
+  }
+
+  if (!isTemplatePlaceholderValue(env.WEBHOOK_URL)) {
+    const url = env.WEBHOOK_URL!.trim();
+    notificationUpdate.webhookUrl = url;
+    notificationUpdate.webhookEnabled = true;
+    notificationUpdate.webhookType = url.includes('discord.com')
+      ? 'DISCORD'
+      : url.includes('hooks.slack.com')
+      ? 'SLACK'
+      : 'GENERIC';
+  }
+
+  return { marketDataUpdate, notificationUpdate };
 }
 
 /**

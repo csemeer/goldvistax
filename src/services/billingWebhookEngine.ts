@@ -81,6 +81,7 @@ export interface WebhookPersistenceAdapter {
 export interface SessionVerificationResult {
   valid: boolean;
   persona?: string;
+  userId?: string;
   expiresAt?: string;
   expiredAt?: string;
   error?: string;
@@ -327,7 +328,21 @@ export class EnterpriseBillingEngine {
     }
 
     if (token.startsWith('aurum_sess_')) {
-      const rest = token.substring('aurum_sess_'.length);
+      let rest = token.substring('aurum_sess_'.length);
+      let extractedUserId: string | undefined;
+      const uidSepIdx = rest.indexOf('.uid_');
+      if (uidSepIdx !== -1) {
+        const encodedUid = rest.substring(uidSepIdx + 5);
+        rest = rest.substring(0, uidSepIdx);
+        try {
+          const decoded = decodeURIComponent(encodedUid).trim();
+          if (decoded && /^[a-zA-Z0-9_.:-]+$/.test(decoded)) {
+            extractedUserId = decoded;
+          }
+        } catch {
+          // Ignore malformed uid suffix
+        }
+      }
       const lastUnderscore = rest.lastIndexOf('_');
       const persona = lastUnderscore !== -1 ? rest.substring(0, lastUnderscore) : rest;
       const expStr = lastUnderscore !== -1 ? rest.substring(lastUnderscore + 1) : '0';
@@ -346,6 +361,7 @@ export class EnterpriseBillingEngine {
       return {
         valid: true,
         persona,
+        ...(extractedUserId ? { userId: extractedUserId } : {}),
         expiresAt: exp > 0 ? new Date(exp * 1000).toISOString() : '2099-12-31T23:59:59Z',
         verifiedAt: new Date().toISOString(),
         entitlements: {

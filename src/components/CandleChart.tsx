@@ -27,6 +27,7 @@ import {
   HistoricalCoverageReport,
   HistoricalRangePeriod,
   IndicatorSnapshot,
+  InstrumentId,
   Timeframe,
   TradePlan,
 } from '../domain/types';
@@ -39,6 +40,9 @@ import {
   calculateRSI,
   calculateMACD,
   calculateHeikinAshi,
+  computeSmartChartAnnotations,
+  detectLiquiditySweeps,
+  LiquiditySweepDirection,
 } from '../services/indicators';
 import {
   ZoomIn,
@@ -58,12 +62,74 @@ import {
   X,
   Check,
   Monitor,
+  GitCompare,
+  Crosshair,
 } from 'lucide-react';
+import {
+  AlignedHistoricalComparisonSeries,
+  alignHistoricalYearComparisonSeries,
+  buildHistoricalYearAnalogCandles,
+  HISTORICAL_ANALOG_PROFILES,
+  HISTORICAL_YEAR_ANALOG_PRESETS,
+  HistoricalAnalogProfile,
+  HistoricalComparisonAlignMode,
+  HistoricalYearSeriesPayload,
+  MacroCatalystCategory,
+  projectHistoricalAnalogSeries,
+  resolveChartNewsCatalysts,
+} from '../services/macroData';
 
 export type ChartType = 'CANDLES' | 'HEIKIN_ASHI' | 'LINE' | 'AREA' | 'BARS';
+export type SmartAnnotationLayerScope = 'ALL' | 'LIQUIDITY' | 'PIVOTS';
+
+export const GLOBAL_SMART_ANNOTATION_STORAGE_KEY = 'goldvista_global_smart_annotation_v1';
+let globalSmartAnnotationMemory = false;
+const smartAnnotationListeners = new Set<(enabled: boolean) => void>();
+
+export function getGlobalSmartAnnotationEnabled(): boolean {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const saved = window.localStorage.getItem(GLOBAL_SMART_ANNOTATION_STORAGE_KEY);
+      if (saved === 'true') {
+        globalSmartAnnotationMemory = true;
+        return true;
+      }
+      if (saved === 'false') {
+        globalSmartAnnotationMemory = false;
+        return false;
+      }
+    }
+  } catch {
+    // Ignore storage read restrictions inside sandboxed iframes
+  }
+  return globalSmartAnnotationMemory;
+}
+
+export function setGlobalSmartAnnotationEnabled(enabled: boolean): void {
+  globalSmartAnnotationMemory = Boolean(enabled);
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      window.localStorage.setItem(
+        GLOBAL_SMART_ANNOTATION_STORAGE_KEY,
+        globalSmartAnnotationMemory ? 'true' : 'false'
+      );
+    }
+  } catch {
+    // Ignore storage write restrictions
+  }
+  smartAnnotationListeners.forEach((listener) => listener(globalSmartAnnotationMemory));
+}
+
+export function subscribeGlobalSmartAnnotation(listener: (enabled: boolean) => void): () => void {
+  smartAnnotationListeners.add(listener);
+  return () => {
+    smartAnnotationListeners.delete(listener);
+  };
+}
 
 interface CandleChartProps {
   candles: Candle[];
+  instrumentId?: InstrumentId;
   timeframe?: Timeframe;
   period?: HistoricalRangePeriod;
   onTimeframeChange?: (tf: Timeframe) => void;
@@ -82,10 +148,13 @@ interface CandleChartProps {
   height?: number;
   isFitToScreen?: boolean;
   onToggleFitScreen?: () => void;
+  smartAnnotationsEnabled?: boolean;
+  onToggleSmartAnnotations?: (enabled: boolean) => void;
 }
 
 export const CandleChart: React.FC<CandleChartProps> = ({
   candles,
+  instrumentId = 'XAUUSD',
   timeframe = '1D',
   period = '5Y',
   onTimeframeChange,
@@ -93,18 +162,36 @@ export const CandleChart: React.FC<CandleChartProps> = ({
   customHorizon,
   onCustomHorizonChange,
   tradePlan,
+  indicators,
   coverageReport,
   unit = 'USD/oz',
   instrumentName = 'Gold Spot',
   height = 500,
   isFitToScreen = false,
   onToggleFitScreen,
+  smartAnnotationsEnabled,
+  onToggleSmartAnnotations,
 }) => {
   // Chart Configuration & State
   const [chartType, setChartType] = useState<ChartType>('CANDLES');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showIndicatorMenu, setShowIndicatorMenu] = useState(false);
   const [showHorizonModal, setShowHorizonModal] = useState(false);
+  const [globalSmartActive, setGlobalSmartActive] = useState<boolean>(() =>
+    smartAnnotationsEnabled !== undefined ? smartAnnotationsEnabled : getGlobalSmartAnnotationEnabled()
+  );
+  const [smartLayerScope, setSmartLayerScope] = useState<SmartAnnotationLayerScope>('ALL');
+  const [showNewsCatalysts, setShowNewsCatalysts] = useState<boolean>(false);
+  const [newsCategoryFilter, setNewsCategoryFilter] = useState<MacroCatalystCategory | 'ALL'>('ALL');
+  const [showLiquiditySweeps, setShowLiquiditySweeps] = useState<boolean>(false);
+  const [sweepDirectionFilter, setSweepDirectionFilter] = useState<'ALL' | LiquiditySweepDirection>('ALL');
+  const [compareYearsEnabled, setCompareYearsEnabled] = useState<boolean>(false);
+  const [selectedCompareYears, setSelectedCompareYears] = useState<number[]>([2020]);
+  const [compareAlignMode, setCompareAlignMode] = useState<HistoricalComparisonAlignMode>('FULL_YEAR_FIT');
+  const [customCompareYearInput, setCustomCompareYearInput] = useState<string>('2008');
+  const [fetchedYearSeries, setFetchedYearSeries] = useState<Record<number, HistoricalYearSeriesPayload>>({});
+  const [loadingCompareYears, setLoadingCompareYears] = useState<Record<number, boolean>>({});
+  const [compareFetchError, setCompareFetchError] = useState<string | null>(null);
   const [selectedYears, setSelectedYears] = useState<number>(customHorizon?.years || 5);
   const [customStart, setCustomStart] = useState<string>(
     customHorizon?.startDate || '2021-11-02'
@@ -124,7 +211,9 @@ export const CandleChart: React.FC<CandleChartProps> = ({
     bollinger: false,
     supertrend: true,
     tradePlan: true,
+    historicalAnalog: false,
   });
+  const [selectedAnalogId, setSelectedAnalogId] = useState<HistoricalAnalogProfile['id']>('2024-EASING');
 
   const [subpanels, setSubpanels] = useState({
     volume: true,
@@ -185,6 +274,109 @@ export const CandleChart: React.FC<CandleChartProps> = ({
       window.removeEventListener('resize', updateSize);
     };
   }, [isFullscreen, isFitToScreen, height]);
+
+  // Keep Smart Annotation synchronized globally across all CandleChart instances and workspaces
+  useEffect(() => {
+    if (smartAnnotationsEnabled !== undefined) {
+      setGlobalSmartActive(smartAnnotationsEnabled);
+      setGlobalSmartAnnotationEnabled(smartAnnotationsEnabled);
+    }
+  }, [smartAnnotationsEnabled]);
+
+  useEffect(() => {
+    return subscribeGlobalSmartAnnotation((nextEnabled) => {
+      setGlobalSmartActive(nextEnabled);
+    });
+  }, []);
+
+  const isSmartAnnotationActive =
+    smartAnnotationsEnabled !== undefined ? smartAnnotationsEnabled : globalSmartActive;
+
+  const handleToggleSmartAnnotation = useCallback(() => {
+    const nextValue = !isSmartAnnotationActive;
+    setGlobalSmartAnnotationEnabled(nextValue);
+    setGlobalSmartActive(nextValue);
+    onToggleSmartAnnotations?.(nextValue);
+  }, [isSmartAnnotationActive, onToggleSmartAnnotations]);
+
+  // Fetch secondary historical year XAU/USD data series directly from backend API
+  const fetchCompareYearSeries = useCallback(
+    async (year: number, forceRefresh = false) => {
+      const normalizedYear = Math.max(1990, Math.min(2025, Math.round(year)));
+      if (!forceRefresh && fetchedYearSeries[normalizedYear]) return;
+
+      setCompareFetchError(null);
+      setLoadingCompareYears((prev) => ({ ...prev, [normalizedYear]: true }));
+      try {
+        const res = await fetch(
+          `/api/market/historical-analog?year=${normalizedYear}&instrumentId=${encodeURIComponent(instrumentId)}`
+        );
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status} loading ${normalizedYear} series`);
+        }
+        const json = await res.json();
+        if (!json?.success || !Array.isArray(json.candles) || json.candles.length < 2) {
+          throw new Error(json?.error || `No historical bars returned for ${normalizedYear}`);
+        }
+        const payload: HistoricalYearSeriesPayload = {
+          year: normalizedYear,
+          label: json.label || `${normalizedYear} Historical Analog`,
+          macroContext: json.macroContext || '',
+          startDate: json.startDate || `${normalizedYear}-01-02`,
+          endDate: json.endDate || `${normalizedYear}-12-31`,
+          source: json.source === 'YAHOO_LIVE' ? 'YAHOO_LIVE' : 'HISTORICAL_ARCHIVE_CALIBRATED',
+          candles: json.candles,
+        };
+        setFetchedYearSeries((prev) => ({ ...prev, [normalizedYear]: payload }));
+      } catch (err: any) {
+        setCompareFetchError(
+          err?.message || `Unable to fetch ${normalizedYear} historical series from server.`
+        );
+      } finally {
+        setLoadingCompareYears((prev) => ({ ...prev, [normalizedYear]: false }));
+      }
+    },
+    [fetchedYearSeries, instrumentId]
+  );
+
+  useEffect(() => {
+    if (!compareYearsEnabled) return;
+    selectedCompareYears.forEach((yr) => {
+      if (!fetchedYearSeries[yr] && !loadingCompareYears[yr]) {
+        void fetchCompareYearSeries(yr);
+      }
+    });
+  }, [compareYearsEnabled, selectedCompareYears, fetchedYearSeries, loadingCompareYears, fetchCompareYearSeries]);
+
+  const handleToggleCompareYear = useCallback((year: number) => {
+    const normalizedYear = Math.max(1990, Math.min(2025, Math.round(year)));
+    setSelectedCompareYears((prev) => {
+      if (prev.includes(normalizedYear)) {
+        if (prev.length === 1) return prev;
+        return prev.filter((y) => y !== normalizedYear);
+      }
+      if (prev.length >= 2) {
+        return [prev[1], normalizedYear];
+      }
+      return [...prev, normalizedYear];
+    });
+  }, []);
+
+  const handleAddCustomCompareYear = useCallback(() => {
+    const parsed = parseInt(customCompareYearInput, 10);
+    if (!Number.isFinite(parsed) || parsed < 1990 || parsed > 2025) {
+      setCompareFetchError('Enter a historical comparison year between 1990 and 2025.');
+      return;
+    }
+    setCompareFetchError(null);
+    setSelectedCompareYears((prev) => {
+      if (prev.includes(parsed)) return prev;
+      if (prev.length >= 2) return [prev[1], parsed];
+      return [...prev, parsed];
+    });
+    if (!compareYearsEnabled) setCompareYearsEnabled(true);
+    void fetchCompareYearSeries(parsed);
+  }, [customCompareYearInput, compareYearsEnabled, fetchCompareYearSeries]);
 
   // Historical Ranges and Resolutions
   const periods: HistoricalRangePeriod[] = [
@@ -269,6 +461,69 @@ export const CandleChart: React.FC<CandleChartProps> = ({
   const timeAxisY = macdY + macdPanelHeight;
   const svgTotalHeight = timeAxisY + timeGutterHeight;
 
+  // Historical Analog Projection across trailing bars in viewport
+  const analogProjection = useMemo(() => {
+    if (!overlays.historicalAnalog || candles.length < 2) return null;
+    const windowBars = Math.min(candles.length - 1, Math.max(15, Math.floor(clampedVisibleCount * 0.72)));
+    return projectHistoricalAnalogSeries(candles, selectedAnalogId, windowBars);
+  }, [overlays.historicalAnalog, candles, selectedAnalogId, clampedVisibleCount]);
+
+  // Fetched Secondary Historical Year Comparison Series (e.g., 2008, 2020) aligned onto chart
+  const alignedYearComparisons: AlignedHistoricalComparisonSeries[] = useMemo(() => {
+    if (!compareYearsEnabled || candles.length < 2) return [];
+    const palette = ['#22d3ee', '#fb7185'];
+    const windowBars = Math.min(candles.length - 1, Math.max(15, Math.floor(clampedVisibleCount * 0.82)));
+    const results: AlignedHistoricalComparisonSeries[] = [];
+    selectedCompareYears.forEach((yr, idx) => {
+      const payload = fetchedYearSeries[yr];
+      if (!payload) return;
+      const aligned = alignHistoricalYearComparisonSeries(candles, payload, {
+        windowBars,
+        alignMode: compareAlignMode,
+        colorHex: palette[idx % palette.length],
+      });
+      if (aligned) results.push(aligned);
+    });
+    return results;
+  }, [compareYearsEnabled, candles, selectedCompareYears, fetchedYearSeries, clampedVisibleCount, compareAlignMode]);
+
+  // Smart Annotation Engine: institutional volume liquidity zones + horizontal & swing S/R pivots
+  const smartAnnotations = useMemo(() => {
+    if (!isSmartAnnotationActive || candles.length === 0) return null;
+    return computeSmartChartAnnotations(candles, {
+      maxLiquidityZones: 4,
+      swingWindow: Math.max(2, Math.min(5, Math.round(clampedVisibleCount / 22))),
+      maxSwingPivots: 8,
+      lookbackBars: Math.max(40, Math.min(candles.length, clampedVisibleCount * 2)),
+      supportResistanceOverride: indicators?.supportResistance || null,
+    });
+  }, [isSmartAnnotationActive, candles, clampedVisibleCount, indicators?.supportResistance]);
+
+  // News Catalyst Filter: High-impact macro event markers matched to current chart timeframe
+  const newsCatalystData = useMemo(() => {
+    if (!showNewsCatalysts || candles.length === 0) return null;
+    return resolveChartNewsCatalysts(candles, timeframe, {
+      categoryFilter: newsCategoryFilter,
+    });
+  }, [showNewsCatalysts, candles, timeframe, newsCategoryFilter]);
+
+  // Liquidity Sweep Engine: Flags wick-only breaks of prior unbroken swing highs/lows
+  const liquiditySweepData = useMemo(() => {
+    if (!showLiquiditySweeps || candles.length < 7) return null;
+    return detectLiquiditySweeps(candles, {
+      swingWindow: 2,
+      maxSwingAgeBars: 65,
+      minRejectionWickRatio: 0.25,
+      maxSweeps: 14,
+    });
+  }, [showLiquiditySweeps, candles]);
+
+  const filteredLiquiditySweeps = useMemo(() => {
+    if (!liquiditySweepData) return [];
+    if (sweepDirectionFilter === 'ALL') return liquiditySweepData.sweeps;
+    return liquiditySweepData.sweeps.filter((s) => s.direction === sweepDirectionFilter);
+  }, [liquiditySweepData, sweepDirectionFilter]);
+
   // Price Scaling inside visible viewport
   const { minPrice, maxPrice, maxVolume } = useMemo(() => {
     if (visibleCandles.length === 0) return { minPrice: 0, maxPrice: 1, maxVolume: 1 };
@@ -283,6 +538,30 @@ export const CandleChart: React.FC<CandleChartProps> = ({
       if (c.volume > maxVol) maxVol = c.volume;
     }
 
+    // Include visible Historical Analog curve bounds when enabled
+    if (overlays.historicalAnalog && analogProjection) {
+      for (let i = 0; i < visibleCandles.length; i++) {
+        const val = analogProjection.values[startIndex + i];
+        if (Number.isFinite(val) && val > 0) {
+          if (val < min) min = val;
+          if (val > max) max = val;
+        }
+      }
+    }
+
+    // Include visible fetched Historical Year Comparison series bounds when enabled
+    if (compareYearsEnabled && alignedYearComparisons.length > 0) {
+      for (const comp of alignedYearComparisons) {
+        for (let i = 0; i < visibleCandles.length; i++) {
+          const val = comp.normalizedValues[startIndex + i];
+          if (Number.isFinite(val) && val > 0) {
+            if (val < min) min = val;
+            if (val > max) max = val;
+          }
+        }
+      }
+    }
+
     // Include active trade plan levels if visible in range
     if (overlays.tradePlan && tradePlan) {
       min = Math.min(min, tradePlan.stopLossPrice);
@@ -295,7 +574,7 @@ export const CandleChart: React.FC<CandleChartProps> = ({
       maxPrice: max + padding,
       maxVolume: maxVol,
     };
-  }, [visibleCandles, overlays.tradePlan, tradePlan]);
+  }, [visibleCandles, overlays.tradePlan, overlays.historicalAnalog, compareYearsEnabled, alignedYearComparisons, tradePlan, analogProjection, startIndex]);
 
   // Coordinate Conversion Helpers
   const priceToY = useCallback(
@@ -415,6 +694,26 @@ export const CandleChart: React.FC<CandleChartProps> = ({
     return p;
   }, [visibleCandles, candleStep, priceToY]);
 
+  // Historical Analog Secondary Shaded Area Path (between analog curve and anchor baseline)
+  const analogShadedAreaPath = useMemo(() => {
+    if (!overlays.historicalAnalog || !analogProjection || visibleCandles.length < 2) return '';
+    const points: { x: number; y: number }[] = [];
+    for (let i = 0; i < visibleCandles.length; i++) {
+      const val = analogProjection.values[startIndex + i];
+      if (Number.isFinite(val) && val > 0) {
+        points.push({ x: i * candleStep + candleStep / 2, y: priceToY(val) });
+      }
+    }
+    if (points.length < 2) return '';
+    const anchorY = Math.max(0, Math.min(mainChartHeight, priceToY(analogProjection.anchorPrice)));
+    let p = `M ${points[0].x.toFixed(1)} ${anchorY.toFixed(1)}`;
+    for (let i = 0; i < points.length; i++) {
+      p += ` L ${points[i].x.toFixed(1)} ${points[i].y.toFixed(1)}`;
+    }
+    p += ` L ${points[points.length - 1].x.toFixed(1)} ${anchorY.toFixed(1)} Z`;
+    return p;
+  }, [overlays.historicalAnalog, analogProjection, visibleCandles.length, startIndex, candleStep, priceToY, mainChartHeight]);
+
   // Panning & Drag Handlers
   const handleMouseDown = (e: React.MouseEvent) => {
     setIsDragging(true);
@@ -523,8 +822,10 @@ export const CandleChart: React.FC<CandleChartProps> = ({
         middle: indicatorSeries.bb.middle[fullIdx],
         lower: indicatorSeries.bb.lower[fullIdx],
       },
+      analogPrice: analogProjection?.values[fullIdx],
+      analogPct: analogProjection?.pctChanges[fullIdx],
     };
-  }, [indicatorSeries, displayCandle, hoverIndex, startIndex, visibleCandles.length]);
+  }, [indicatorSeries, displayCandle, hoverIndex, startIndex, visibleCandles.length, analogProjection]);
 
   const candleChange = displayCandle ? displayCandle.close - displayCandle.open : 0;
   const candleChangePct =
@@ -758,6 +1059,66 @@ export const CandleChart: React.FC<CandleChartProps> = ({
                     />
                   </label>
                 )}
+                <label className="flex items-center justify-between text-slate-300 hover:text-white cursor-pointer">
+                  <span className="flex items-center gap-2">
+                    <span className="w-2.5 h-2.5 rounded-full bg-violet-400"></span>
+                    Historical Analog Overlay
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={overlays.historicalAnalog}
+                    onChange={(e) => setOverlays((o) => ({ ...o, historicalAnalog: e.target.checked }))}
+                    className="accent-violet-400"
+                  />
+                </label>
+                <label className="flex items-center justify-between text-slate-300 hover:text-white cursor-pointer">
+                  <span className="flex items-center gap-2">
+                    <span className="w-2.5 h-2.5 rounded-full bg-amber-400"></span>
+                    Smart Annotation (Zones & Pivots)
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={isSmartAnnotationActive}
+                    onChange={handleToggleSmartAnnotation}
+                    className="accent-amber-500"
+                  />
+                </label>
+                <label className="flex items-center justify-between text-slate-300 hover:text-white cursor-pointer">
+                  <span className="flex items-center gap-2">
+                    <span className="w-2.5 h-2.5 rounded-full bg-sky-400"></span>
+                    News Catalyst (FOMC / NFP / CPI)
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={showNewsCatalysts}
+                    onChange={() => setShowNewsCatalysts((prev) => !prev)}
+                    className="accent-sky-400"
+                  />
+                </label>
+                <label className="flex items-center justify-between text-slate-300 hover:text-white cursor-pointer">
+                  <span className="flex items-center gap-2">
+                    <span className="w-2.5 h-2.5 rounded-full bg-rose-400"></span>
+                    Liquidity Sweep (Wick Stop-Hunts)
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={showLiquiditySweeps}
+                    onChange={() => setShowLiquiditySweeps((prev) => !prev)}
+                    className="accent-rose-400"
+                  />
+                </label>
+                <label className="flex items-center justify-between text-slate-300 hover:text-white cursor-pointer">
+                  <span className="flex items-center gap-2">
+                    <span className="w-2.5 h-2.5 rounded-full bg-cyan-400"></span>
+                    Compare Historical Years (2008 / 2020)
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={compareYearsEnabled}
+                    onChange={() => setCompareYearsEnabled((prev) => !prev)}
+                    className="accent-cyan-400"
+                  />
+                </label>
 
                 <div className="font-bold text-slate-200 pt-2 pb-1 border-t border-slate-800 text-[11px] uppercase tracking-wider">
                   Oscillator Subpanels
@@ -792,6 +1153,94 @@ export const CandleChart: React.FC<CandleChartProps> = ({
               </div>
             )}
           </div>
+
+          {/* Historical Analog Overlay Quick Toggle (Always accessible across viewports) */}
+          <button
+            type="button"
+            onClick={() => setOverlays((o) => ({ ...o, historicalAnalog: !o.historicalAnalog }))}
+            aria-pressed={overlays.historicalAnalog}
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-medium transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+              overlays.historicalAnalog
+                ? 'bg-violet-500/20 text-violet-200 border-violet-500/40 font-semibold shadow-xs'
+                : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-slate-700 hover:text-white'
+            }`}
+            title="Toggle Historical Macro Regime Analog Overlay (Shaded XAU/USD Path)"
+          >
+            <GitCompare className="w-3.5 h-3.5 text-violet-400" aria-hidden="true" />
+            <span>Historical Analog</span>
+          </button>
+
+          {/* Global Smart Annotation Toggle (Institutional Liquidity Zones & S/R Pivots) */}
+          <button
+            type="button"
+            role="switch"
+            aria-checked={isSmartAnnotationActive}
+            aria-label="Smart Annotation"
+            onClick={handleToggleSmartAnnotation}
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-medium transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+              isSmartAnnotationActive
+                ? 'bg-amber-500/20 text-amber-200 border-amber-500/50 font-semibold shadow-xs'
+                : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-slate-700 hover:text-white'
+            }`}
+            title="Toggle Global Smart Annotation (Marks institutional liquidity zones and support/resistance pivots across all charts)"
+          >
+            <Layers className="w-3.5 h-3.5 text-amber-400" aria-hidden="true" />
+            <span>Smart Annotation</span>
+          </button>
+
+          {/* News Catalyst Filter Toggle (High-Impact Macroeconomic Markers by Timeframe) */}
+          <button
+            type="button"
+            role="switch"
+            aria-checked={showNewsCatalysts}
+            aria-label="News Catalyst"
+            onClick={() => setShowNewsCatalysts((prev) => !prev)}
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-medium transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+              showNewsCatalysts
+                ? 'bg-sky-500/20 text-sky-200 border-sky-500/50 font-semibold shadow-xs'
+                : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-slate-700 hover:text-white'
+            }`}
+            title="Toggle News Catalyst Filter (High-impact FOMC, NFP, CPI macroeconomic markers mapped to current timeframe)"
+          >
+            <Calendar className="w-3.5 h-3.5 text-sky-400" aria-hidden="true" />
+            <span>News Catalyst</span>
+          </button>
+
+          {/* Liquidity Sweep Marker Toggle (Wick-Only Stop-Hunt Detection) */}
+          <button
+            type="button"
+            role="switch"
+            aria-checked={showLiquiditySweeps}
+            aria-label="Liquidity Sweep"
+            onClick={() => setShowLiquiditySweeps((prev) => !prev)}
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-medium transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+              showLiquiditySweeps
+                ? 'bg-rose-500/20 text-rose-200 border-rose-500/50 font-semibold shadow-xs'
+                : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-slate-700 hover:text-white'
+            }`}
+            title="Toggle Liquidity Sweep Markers (Flags wick-only breaks of previous swing highs/lows before reversals)"
+          >
+            <Crosshair className="w-3.5 h-3.5 text-rose-400" aria-hidden="true" />
+            <span>Liquidity Sweep</span>
+          </button>
+
+          {/* Historical Year Compare Overlay Toggle (Fetch & Overlay 2008 / 2020 / Custom Year) */}
+          <button
+            type="button"
+            role="switch"
+            aria-checked={compareYearsEnabled}
+            aria-label="Compare Years"
+            onClick={() => setCompareYearsEnabled((prev) => !prev)}
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-medium transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+              compareYearsEnabled
+                ? 'bg-cyan-500/20 text-cyan-200 border-cyan-500/50 font-semibold shadow-xs'
+                : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-slate-700 hover:text-white'
+            }`}
+            title="Compare current price action against fetched secondary historical year series (e.g., 2008, 2020)"
+          >
+            <TrendingUp className="w-3.5 h-3.5 text-cyan-400" aria-hidden="true" />
+            <span>Compare Years</span>
+          </button>
 
           {/* Quick Indicator Overlays Pill Bar */}
           <div className="hidden lg:flex items-center gap-1 bg-slate-900 border border-slate-800 rounded-lg p-0.5">
@@ -845,9 +1294,9 @@ export const CandleChart: React.FC<CandleChartProps> = ({
             >
               RSI
             </button>
-            <button
+              <button
               onClick={() => setSubpanels((s) => ({ ...s, macd: !s.macd }))}
-              className={`px-2 py-0.5 rounded text-[11px] transition-colors ${
+              className={`px-2 py-0.5 rounded text-[11px] transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                 subpanels.macd
                   ? 'bg-sky-500/20 text-sky-300 font-semibold border border-sky-500/40'
                   : 'text-slate-400 hover:text-slate-200'
@@ -1128,6 +1577,409 @@ export const CandleChart: React.FC<CandleChartProps> = ({
         )}
       </div>
 
+      {/* 2B. HISTORICAL ANALOG MACRO REGIME SELECTOR & SUMMARY BAR */}
+      {overlays.historicalAnalog && analogProjection && (
+        <div className="flex flex-wrap items-center justify-between gap-2.5 py-2 px-1 border-b border-slate-800/70 bg-slate-900/40 text-xs">
+          <div className="flex items-center gap-1.5 overflow-x-auto">
+            <span className="text-[11px] font-mono text-violet-300 font-semibold flex items-center gap-1 shrink-0 mr-1">
+              <GitCompare className="w-3.5 h-3.5" aria-hidden="true" />
+              Historical Analog:
+            </span>
+            {HISTORICAL_ANALOG_PROFILES.map((prof) => {
+              const isSelected = prof.id === selectedAnalogId;
+              return (
+                <button
+                  key={prof.id}
+                  type="button"
+                  onClick={() => setSelectedAnalogId(prof.id)}
+                  className={`px-2.5 py-1 rounded text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                    isSelected
+                      ? 'bg-violet-500/25 text-violet-200 border border-violet-400/50'
+                      : 'bg-slate-900 text-slate-400 border border-slate-800 hover:text-slate-200'
+                  }`}
+                >
+                  {prof.shortLabel}
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono text-slate-400 tabular-nums">
+            <span className="text-violet-300">{analogProjection.profile.periodLabel}</span>
+            <span aria-hidden="true">·</span>
+            <span>Match {analogProjection.profile.similarityScorePct}%</span>
+            <span aria-hidden="true">·</span>
+            <span className={analogProjection.summaryStats.analogReturnPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+              Analog Path {analogProjection.summaryStats.analogReturnPct >= 0 ? '+' : ''}
+              {analogProjection.summaryStats.analogReturnPct}% (${analogProjection.summaryStats.projectedPrice.toFixed(2)})
+            </span>
+            <span aria-hidden="true">·</span>
+            <span>
+              Spot vs Analog{' '}
+              <strong className={analogProjection.summaryStats.divergencePct >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                {analogProjection.summaryStats.divergencePct >= 0 ? '+' : ''}
+                {analogProjection.summaryStats.divergencePct}%
+              </strong>
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* 2B-bis. HISTORICAL YEAR COMPARISON CONTROL & TELEMETRY BAR (2008, 2020, CUSTOM) */}
+      {compareYearsEnabled && (
+        <div
+          aria-label="Historical Year Comparison Bar"
+          className="flex flex-col gap-2 py-2 px-2 border-b border-slate-800/70 bg-slate-900/50 text-xs"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-[11px] font-mono text-cyan-300 font-semibold flex items-center gap-1 shrink-0 mr-1">
+                <TrendingUp className="w-3.5 h-3.5" aria-hidden="true" />
+                Compare Year Series:
+              </span>
+              {HISTORICAL_YEAR_ANALOG_PRESETS.map((preset) => {
+                const isSelected = selectedCompareYears.includes(preset.year);
+                const isLoading = Boolean(loadingCompareYears[preset.year]);
+                return (
+                  <button
+                    key={preset.year}
+                    type="button"
+                    onClick={() => handleToggleCompareYear(preset.year)}
+                    aria-pressed={isSelected}
+                    className={`px-2.5 py-1 rounded text-[11px] font-mono font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums ${
+                      isSelected
+                        ? 'bg-cyan-500/20 text-cyan-200 border border-cyan-400/60'
+                        : 'bg-slate-900 text-slate-400 border border-slate-800 hover:text-slate-200'
+                    }`}
+                    title={preset.macroContext}
+                  >
+                    {preset.shortLabel}
+                    {isLoading ? ' …' : ''}
+                  </button>
+                );
+              })}
+
+              {/* Quick Dual Comparison: 2008 + 2020 */}
+              <button
+                type="button"
+                onClick={() => setSelectedCompareYears([2008, 2020])}
+                className="px-2.5 py-1 rounded text-[11px] font-mono font-medium bg-slate-900 text-slate-300 border border-slate-700 hover:border-cyan-500/50 hover:text-cyan-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                title="Overlay both 2008 GFC and 2020 QE trajectories together"
+              >
+                2008 + 2020
+              </button>
+
+              {/* Custom Year Input */}
+              <div className="flex items-center gap-1 ml-1">
+                <input
+                  type="number"
+                  min={1990}
+                  max={2025}
+                  value={customCompareYearInput}
+                  onChange={(e) => setCustomCompareYearInput(e.target.value)}
+                  aria-label="Custom Comparison Year"
+                  className="w-20 bg-slate-950 border border-slate-700 rounded px-2 py-1 text-[11px] font-mono text-slate-200 tabular-nums focus:outline-none focus:border-cyan-400"
+                  placeholder="Year"
+                />
+                <button
+                  type="button"
+                  onClick={handleAddCustomCompareYear}
+                  className="px-2.5 py-1 rounded text-[11px] font-medium bg-cyan-600 hover:bg-cyan-500 text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  Overlay Year
+                </button>
+              </div>
+            </div>
+
+            {/* Alignment Mode Toggle */}
+            <div className="flex items-center gap-1 bg-slate-950 border border-slate-800 rounded p-0.5">
+              <button
+                type="button"
+                onClick={() => setCompareAlignMode('FULL_YEAR_FIT')}
+                className={`px-2 py-0.5 rounded text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  compareAlignMode === 'FULL_YEAR_FIT'
+                    ? 'bg-cyan-500/20 text-cyan-200'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Full Year Fit
+              </button>
+              <button
+                type="button"
+                onClick={() => setCompareAlignMode('MATCH_BAR_COUNT')}
+                className={`px-2 py-0.5 rounded text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  compareAlignMode === 'MATCH_BAR_COUNT'
+                    ? 'bg-cyan-500/20 text-cyan-200'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Match Bars
+              </button>
+            </div>
+          </div>
+
+          {/* Loading / Error / Populated Per-Year Summary Strip */}
+          {Object.entries(loadingCompareYears).some(([, busy]) => busy) && (
+            <div className="text-[11px] font-mono text-cyan-300">
+              Fetching secondary historical XAU/USD data series for{' '}
+              {Object.entries(loadingCompareYears)
+                .filter(([, busy]) => busy)
+                .map(([yr]) => yr)
+                .join(', ')}
+              …
+            </div>
+          )}
+
+          {compareFetchError && (
+            <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono text-rose-300 bg-rose-950/30 border border-rose-500/30 rounded px-2.5 py-1.5">
+              <span>{compareFetchError}</span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    selectedCompareYears.forEach((yr) => void fetchCompareYearSeries(yr, true));
+                  }}
+                  className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-200 hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  Retry Fetch
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const nextCache: Record<number, HistoricalYearSeriesPayload> = {};
+                    selectedCompareYears.forEach((yr) => {
+                      nextCache[yr] = buildHistoricalYearAnalogCandles(yr);
+                    });
+                    setFetchedYearSeries((prev) => ({ ...prev, ...nextCache }));
+                    setCompareFetchError(null);
+                  }}
+                  className="px-2 py-0.5 rounded bg-cyan-600/20 border border-cyan-500/40 text-cyan-200 hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  Load Offline Archive
+                </button>
+              </div>
+            </div>
+          )}
+
+          {alignedYearComparisons.length > 0 && (
+            <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-[11px] font-mono text-slate-400 tabular-nums">
+              {alignedYearComparisons.map((comp) => (
+                <div key={comp.year} className="flex flex-wrap items-center gap-2">
+                  <span
+                    className="w-2.5 h-0.5 inline-block shrink-0"
+                    style={{ backgroundColor: comp.colorHex }}
+                    aria-hidden="true"
+                  />
+                  <span className="font-semibold text-slate-200">{comp.label}</span>
+                  <span aria-hidden="true">·</span>
+                  <span>
+                    Path r=
+                    <strong className={comp.summary.pearsonCorrelation >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                      {comp.summary.pearsonCorrelation >= 0 ? '+' : ''}
+                      {comp.summary.pearsonCorrelation.toFixed(2)}
+                    </strong>
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span className={comp.summary.historicalReturnPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                    {comp.year}: {comp.summary.historicalReturnPct >= 0 ? '+' : ''}
+                    {comp.summary.historicalReturnPct}%
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span>
+                    Spread{' '}
+                    <strong className={comp.summary.spreadPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                      {comp.summary.spreadPct >= 0 ? '+' : ''}
+                      {comp.summary.spreadPct}%
+                    </strong>
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span>
+                    Range ${comp.summary.historicalLow.toFixed(0)}–${comp.summary.historicalHigh.toFixed(0)}/oz
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-slate-500">
+                    {comp.source === 'YAHOO_LIVE' ? 'Exchange Archive' : 'Calibrated Archive'} ({comp.summary.barCountUsed} bars)
+                  </span>
+                  {selectedCompareYears.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={() => handleToggleCompareYear(comp.year)}
+                      aria-label={`Remove ${comp.year} comparison`}
+                      className="text-slate-500 hover:text-rose-300 cursor-pointer"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 2C. GLOBAL SMART ANNOTATION DIAGNOSTIC BAR (LIQUIDITY ZONES & S/R PIVOTS) */}
+      {isSmartAnnotationActive && smartAnnotations && smartAnnotations.hasData && (
+        <div
+          aria-label="Smart Annotation Summary Bar"
+          className="flex flex-wrap items-center justify-between gap-2.5 py-2 px-1 border-b border-slate-800/70 bg-slate-900/40 text-xs"
+        >
+          <div className="flex items-center gap-1.5 overflow-x-auto">
+            <span className="text-[11px] font-mono text-amber-300 font-semibold flex items-center gap-1 shrink-0 mr-1">
+              <Layers className="w-3.5 h-3.5" aria-hidden="true" />
+              Smart Annotation:
+            </span>
+            {(
+              [
+                { id: 'ALL', label: 'All Layers' },
+                { id: 'LIQUIDITY', label: 'Liquidity Zones' },
+                { id: 'PIVOTS', label: 'S/R Pivots' },
+              ] as const
+            ).map((opt) => {
+              const active = smartLayerScope === opt.id;
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => setSmartLayerScope(opt.id)}
+                  className={`px-2.5 py-1 rounded text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                    active
+                      ? 'bg-amber-500/20 text-amber-200 border border-amber-500/40'
+                      : 'bg-slate-900 text-slate-400 border border-slate-800 hover:text-slate-200'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono text-slate-400 tabular-nums">
+            <span className="text-amber-300">VPOC ${smartAnnotations.pocPrice.toFixed(2)}</span>
+            <span aria-hidden="true">·</span>
+            <span>
+              VA ${smartAnnotations.valPrice.toFixed(2)}–${smartAnnotations.vahPrice.toFixed(2)}
+            </span>
+            {smartAnnotations.pivotLevels.find((p) => p.id === 'P') && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span className="text-slate-200">
+                  Pivot ${smartAnnotations.pivotLevels.find((p) => p.id === 'P')!.price.toFixed(2)}
+                </span>
+              </>
+            )}
+            <span aria-hidden="true">·</span>
+            <span className="text-rose-400">
+              R1 ${smartAnnotations.pivotLevels.find((p) => p.id === 'R1')?.price.toFixed(2) ?? '—'}
+            </span>
+            <span aria-hidden="true">/</span>
+            <span className="text-emerald-400">
+              S1 ${smartAnnotations.pivotLevels.find((p) => p.id === 'S1')?.price.toFixed(2) ?? '—'}
+            </span>
+            <span aria-hidden="true">·</span>
+            <span>
+              {smartAnnotations.liquidityZones.length} Liquidity Zones · {smartAnnotations.swingPivots.length} Swing Pivots
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* 2D. NEWS CATALYST FILTER & MACRO TIMEFRAME BAR */}
+      {showNewsCatalysts && newsCatalystData && (
+        <div
+          aria-label="News Catalyst Filter Bar"
+          className="flex flex-wrap items-center justify-between gap-2.5 py-2 px-1 border-b border-slate-800/70 bg-slate-900/40 text-xs"
+        >
+          <div className="flex items-center gap-1.5 overflow-x-auto">
+            <span className="text-[11px] font-mono text-sky-300 font-semibold flex items-center gap-1 shrink-0 mr-1">
+              <Calendar className="w-3.5 h-3.5" aria-hidden="true" />
+              News Catalyst:
+            </span>
+            {(
+              [
+                { id: 'ALL', label: 'All Events' },
+                { id: 'FOMC', label: 'FOMC' },
+                { id: 'NFP', label: 'NFP' },
+                { id: 'CPI_PCE', label: 'CPI / PCE' },
+                { id: 'MACRO_SHOCK', label: 'Macro Shocks' },
+              ] as const
+            ).map((opt) => {
+              const active = newsCategoryFilter === opt.id;
+              const count = newsCatalystData.categoryCounts[opt.id];
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => setNewsCategoryFilter(opt.id)}
+                  className={`px-2.5 py-1 rounded text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums ${
+                    active
+                      ? 'bg-sky-500/20 text-sky-200 border border-sky-500/40'
+                      : 'bg-slate-900 text-slate-400 border border-slate-800 hover:text-slate-200'
+                  }`}
+                >
+                  {opt.label} ({count})
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono text-slate-400 tabular-nums">
+            <span className="text-sky-300">{newsCatalystData.timeframeScopeLabel}</span>
+            <span aria-hidden="true">·</span>
+            <span>
+              {newsCatalystData.markers.length} Active Catalyst{newsCatalystData.markers.length === 1 ? '' : 's'}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* 2E. LIQUIDITY SWEEP STOP-HUNT FILTER & DIAGNOSTIC BAR */}
+      {showLiquiditySweeps && liquiditySweepData && (
+        <div
+          aria-label="Liquidity Sweep Summary Bar"
+          className="flex flex-wrap items-center justify-between gap-2.5 py-2 px-1 border-b border-slate-800/70 bg-slate-900/40 text-xs"
+        >
+          <div className="flex items-center gap-1.5 overflow-x-auto">
+            <span className="text-[11px] font-mono text-rose-300 font-semibold flex items-center gap-1 shrink-0 mr-1">
+              <Crosshair className="w-3.5 h-3.5" aria-hidden="true" />
+              Liquidity Sweep:
+            </span>
+            {(
+              [
+                { id: 'ALL', label: `All Sweeps (${liquiditySweepData.totalSweeps})` },
+                { id: 'BULLISH_SWEEP', label: `Bullish Lows (${liquiditySweepData.bullishSweepCount})` },
+                { id: 'BEARISH_SWEEP', label: `Bearish Highs (${liquiditySweepData.bearishSweepCount})` },
+              ] as const
+            ).map((opt) => {
+              const active = sweepDirectionFilter === opt.id;
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => setSweepDirectionFilter(opt.id)}
+                  className={`px-2.5 py-1 rounded text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums ${
+                    active
+                      ? 'bg-rose-500/20 text-rose-200 border border-rose-500/40'
+                      : 'bg-slate-900 text-slate-400 border border-slate-800 hover:text-slate-200'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono text-slate-400 tabular-nums">
+            <span className="text-emerald-400">
+              {liquiditySweepData.confirmedReversalCount} Reversal-Confirmed
+            </span>
+            <span aria-hidden="true">·</span>
+            <span>Avg Wick Rejection {liquiditySweepData.avgRejectionWickPct}%</span>
+            <span aria-hidden="true">·</span>
+            <span>Wick-Only Body Rejection Rule</span>
+          </div>
+        </div>
+      )}
+
       {/* 3. TRADINGVIEW-STYLE REAL-TIME HUD / INSPECTION BAR */}
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 py-1.5 text-xs font-mono tabular-nums text-slate-400 border-b border-slate-800/60">
         {displayCandle && (
@@ -1212,6 +2064,65 @@ export const CandleChart: React.FC<CandleChartProps> = ({
                 </strong>
               </span>
             )}
+            {overlays.historicalAnalog && Number.isFinite(activeHoverMetrics.analogPrice) && (
+              <span className="text-violet-300">
+                Analog:{' '}
+                <strong>
+                  ${activeHoverMetrics.analogPrice?.toFixed(2)} (
+                  {activeHoverMetrics.analogPct !== undefined && activeHoverMetrics.analogPct >= 0 ? '+' : ''}
+                  {activeHoverMetrics.analogPct?.toFixed(2)}%)
+                </strong>
+              </span>
+            )}
+            {compareYearsEnabled &&
+              alignedYearComparisons.map((comp) => {
+                const activeBarIdx =
+                  hoverIndex !== null ? startIndex + hoverIndex : startIndex + visibleCandles.length - 1;
+                const rawPrice = comp.rawHistoricalPrices[activeBarIdx];
+                const pct = comp.historicalPctChanges[activeBarIdx];
+                const histDate = comp.historicalDates[activeBarIdx];
+                if (!Number.isFinite(rawPrice)) return null;
+                return (
+                  <span key={`hud-cmp-${comp.year}`} style={{ color: comp.colorHex }}>
+                    {comp.year} ({histDate}):{' '}
+                    <strong>
+                      ${rawPrice.toFixed(2)} ({pct >= 0 ? '+' : ''}
+                      {pct.toFixed(2)}%)
+                    </strong>
+                  </span>
+                );
+              })}
+            {isSmartAnnotationActive && smartAnnotations?.hasData && (
+              <span className="text-amber-300">
+                VPOC: <strong>${smartAnnotations.pocPrice.toFixed(2)}</strong>
+              </span>
+            )}
+            {showNewsCatalysts &&
+              newsCatalystData &&
+              (() => {
+                const activeBarIdx =
+                  hoverIndex !== null ? startIndex + hoverIndex : startIndex + visibleCandles.length - 1;
+                const match = newsCatalystData.markers.find((m) => m.barIndex === activeBarIdx);
+                if (!match) return null;
+                return (
+                  <span className="text-sky-300">
+                    Catalyst: <strong>{match.shortTag} ({match.actualVsConsensus})</strong>
+                  </span>
+                );
+              })()}
+            {showLiquiditySweeps &&
+              liquiditySweepData &&
+              (() => {
+                const activeBarIdx =
+                  hoverIndex !== null ? startIndex + hoverIndex : startIndex + visibleCandles.length - 1;
+                const match = filteredLiquiditySweeps.find((s) => s.barIndex === activeBarIdx);
+                if (!match) return null;
+                return (
+                  <span className={match.direction === 'BULLISH_SWEEP' ? 'text-emerald-400' : 'text-rose-400'}>
+                    Sweep: <strong>{match.label}</strong>
+                  </span>
+                );
+              })()}
           </div>
         )}
       </div>
@@ -1247,6 +2158,12 @@ export const CandleChart: React.FC<CandleChartProps> = ({
             <linearGradient id="bbBandGradient" x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%" stopColor="#06b6d4" stopOpacity="0.12" />
               <stop offset="100%" stopColor="#06b6d4" stopOpacity="0.06" />
+            </linearGradient>
+
+            {/* Historical Analog Secondary Shaded Gradient */}
+            <linearGradient id="analogShadedGradient" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#a78bfa" stopOpacity="0.28" />
+              <stop offset="100%" stopColor="#a78bfa" stopOpacity="0.04" />
             </linearGradient>
           </defs>
 
@@ -1411,6 +2328,345 @@ export const CandleChart: React.FC<CandleChartProps> = ({
             />
           )}
 
+          {/* Historical Analog Secondary Shaded Line Graph */}
+          {overlays.historicalAnalog && analogProjection && (
+            <g>
+              {analogShadedAreaPath && (
+                <path d={analogShadedAreaPath} fill="url(#analogShadedGradient)" />
+              )}
+              <path
+                d={buildSmoothPath(analogProjection.values)}
+                fill="none"
+                stroke="#a78bfa"
+                strokeWidth="2.1"
+                strokeDasharray="6 3"
+                opacity="0.95"
+              />
+              {/* T=0 Anchor Vertical Reference & Baseline if within visible viewport */}
+              {analogProjection.anchorIndex >= startIndex &&
+                analogProjection.anchorIndex < endIndex && (() => {
+                  const localAnchorIdx = analogProjection.anchorIndex - startIndex;
+                  const anchorX = localAnchorIdx * candleStep + candleStep / 2;
+                  const anchorY = priceToY(analogProjection.anchorPrice);
+                  return (
+                    <g>
+                      <line
+                        x1={anchorX}
+                        y1={0}
+                        x2={anchorX}
+                        y2={mainChartHeight}
+                        stroke="rgba(167, 139, 250, 0.45)"
+                        strokeWidth="1"
+                        strokeDasharray="3 3"
+                      />
+                      <line
+                        x1={anchorX}
+                        y1={anchorY}
+                        x2={chartWidth}
+                        y2={anchorY}
+                        stroke="rgba(167, 139, 250, 0.25)"
+                        strokeWidth="1"
+                        strokeDasharray="2 3"
+                      />
+                      <circle cx={anchorX} cy={anchorY} r="3.5" fill="#a78bfa" />
+                      <rect
+                        x={Math.min(chartWidth - 110, anchorX + 6)}
+                        y={Math.max(6, anchorY - 22)}
+                        width={102}
+                        height={16}
+                        rx="3"
+                        fill="rgba(30, 27, 75, 0.9)"
+                        stroke="rgba(167, 139, 250, 0.5)"
+                      />
+                      <text
+                        x={Math.min(chartWidth - 110, anchorX + 6) + 51}
+                        y={Math.max(6, anchorY - 22) + 11.5}
+                        fill="#ddd6fe"
+                        fontSize="9.5"
+                        fontFamily="JetBrains Mono, monospace"
+                        fontWeight="bold"
+                        textAnchor="middle"
+                      >
+                        Analog T=0 Base
+                      </text>
+                    </g>
+                  );
+                })()}
+              {/* Terminal Analog Marker on Right Price Gutter */}
+              {(() => {
+                const projY = priceToY(analogProjection.summaryStats.projectedPrice);
+                if (!Number.isFinite(projY) || projY < 8 || projY > mainChartHeight - 8) return null;
+                return (
+                  <g>
+                    <rect
+                      x={chartWidth}
+                      y={projY - 9}
+                      width={priceGutterWidth}
+                      height={18}
+                      fill="#7c3aed"
+                      rx="2"
+                    />
+                    <text
+                      x={chartWidth + priceGutterWidth / 2}
+                      y={projY + 3.5}
+                      fill="#f5f3ff"
+                      fontSize="10"
+                      fontFamily="JetBrains Mono, monospace"
+                      fontWeight="bold"
+                      textAnchor="middle"
+                    >
+                      ${analogProjection.summaryStats.projectedPrice.toFixed(0)}
+                    </text>
+                  </g>
+                );
+              })()}
+            </g>
+          )}
+
+          {/* Fetched Secondary Historical Year Comparison Curves (e.g., 2008, 2020) */}
+          {compareYearsEnabled &&
+            alignedYearComparisons.map((comp, compIdx) => {
+              const pathStr = buildSmoothPath(comp.normalizedValues);
+              if (!pathStr) return null;
+              const projPrice = comp.summary.projectedCurrentEquivPrice;
+              const projY = priceToY(projPrice);
+              const anchorInView =
+                comp.anchorIndex >= startIndex && comp.anchorIndex < endIndex;
+              const localAnchorIdx = comp.anchorIndex - startIndex;
+              const anchorX = localAnchorIdx * candleStep + candleStep / 2;
+              const anchorY = priceToY(comp.anchorPrice);
+
+              return (
+                <g key={`compare-svg-${comp.year}`} aria-label={`${comp.year} Historical Comparison Series`}>
+                  <path
+                    d={pathStr}
+                    fill="none"
+                    stroke={comp.colorHex}
+                    strokeWidth="2.1"
+                    strokeDasharray={compIdx === 0 ? 'none' : '6 3'}
+                    opacity="0.92"
+                  />
+                  {anchorInView && (
+                    <g>
+                      <circle cx={anchorX} cy={anchorY} r="3.5" fill={comp.colorHex} />
+                    </g>
+                  )}
+                  {Number.isFinite(projY) && projY >= 8 && projY <= mainChartHeight - 8 && (
+                    <g>
+                      <rect
+                        x={chartWidth}
+                        y={projY - 9}
+                        width={priceGutterWidth}
+                        height={18}
+                        fill={compIdx === 0 ? '#0e7490' : '#be123c'}
+                        rx="2"
+                      />
+                      <text
+                        x={chartWidth + priceGutterWidth / 2}
+                        y={projY + 3.5}
+                        fill="#f8fafc"
+                        fontSize="9.5"
+                        fontFamily="JetBrains Mono, monospace"
+                        fontWeight="bold"
+                        textAnchor="middle"
+                      >
+                        {comp.year} ${projPrice.toFixed(0)}
+                      </text>
+                    </g>
+                  )}
+                </g>
+              );
+            })}
+
+          {/* 4A-bis. SMART ANNOTATION: INSTITUTIONAL LIQUIDITY ZONES & S/R PIVOTS */}
+          {isSmartAnnotationActive &&
+            smartAnnotations &&
+            smartAnnotations.hasData &&
+            (smartLayerScope === 'ALL' || smartLayerScope === 'LIQUIDITY') && (
+              <g aria-label="Smart Annotation Liquidity Zones">
+                {/* 70% Value Area High & Value Area Low Boundary Hairlines */}
+                {[
+                  { label: `VAH $${smartAnnotations.vahPrice.toFixed(2)}`, price: smartAnnotations.vahPrice },
+                  { label: `VAL $${smartAnnotations.valPrice.toFixed(2)}`, price: smartAnnotations.valPrice },
+                ].map((va) => {
+                  const yVa = priceToY(va.price);
+                  if (!Number.isFinite(yVa) || yVa < 6 || yVa > mainChartHeight - 6) return null;
+                  return (
+                    <g key={va.label}>
+                      <line
+                        x1={0}
+                        y1={yVa}
+                        x2={chartWidth}
+                        y2={yVa}
+                        stroke="rgba(148, 163, 184, 0.32)"
+                        strokeWidth="1"
+                        strokeDasharray="2 4"
+                      />
+                    </g>
+                  );
+                })}
+
+                {/* Identified Institutional Volume Liquidity Zones (VPOC + HVN Pools) */}
+                {smartAnnotations.liquidityZones.map((zone) => {
+                  const rawTop = priceToY(zone.priceHigh);
+                  const rawBot = priceToY(zone.priceLow);
+                  if (!Number.isFinite(rawTop) || !Number.isFinite(rawBot)) return null;
+                  const bandTop = Math.min(rawTop, rawBot);
+                  const bandBot = Math.max(rawTop, rawBot);
+                  if (bandBot < 0 || bandTop > mainChartHeight) return null;
+
+                  const clampedTop = Math.max(0, bandTop);
+                  const clampedBot = Math.min(mainChartHeight, Math.max(clampedTop + 12, bandBot));
+                  const bandHeight = clampedBot - clampedTop;
+
+                  const isPoc = zone.zoneRole === 'POC_ANCHOR';
+                  const isSupply = zone.zoneRole === 'SUPPLY_LIQUIDITY';
+                  const fillColor = isPoc
+                    ? 'rgba(245, 158, 11, 0.14)'
+                    : isSupply
+                    ? 'rgba(244, 63, 94, 0.11)'
+                    : 'rgba(16, 185, 129, 0.11)';
+                  const strokeColor = isPoc
+                    ? 'rgba(245, 158, 11, 0.45)'
+                    : isSupply
+                    ? 'rgba(244, 63, 94, 0.38)'
+                    : 'rgba(16, 185, 129, 0.38)';
+                  const textColor = isPoc ? '#fde68a' : isSupply ? '#fecdd3' : '#a7f3d0';
+                  const badgeBg = isPoc
+                    ? 'rgba(120, 53, 15, 0.85)'
+                    : isSupply
+                    ? 'rgba(136, 19, 55, 0.82)'
+                    : 'rgba(6, 78, 59, 0.82)';
+
+                  const densityWidth = Math.min(72, Math.max(16, zone.sharePct * 3.2));
+                  const labelText = `${zone.label} ($${zone.midPrice.toFixed(0)})`;
+                  const labelWidth = Math.min(chartWidth * 0.55, labelText.length * 6.1 + 14);
+
+                  return (
+                    <g key={zone.id}>
+                      <rect
+                        x={0}
+                        y={clampedTop}
+                        width={chartWidth}
+                        height={bandHeight}
+                        fill={fillColor}
+                        stroke={strokeColor}
+                        strokeWidth="0.8"
+                        strokeDasharray={isPoc ? undefined : '4 3'}
+                      />
+                      {/* Institutional Volume Concentration Bar along Right Margin */}
+                      <rect
+                        x={chartWidth - densityWidth}
+                        y={clampedTop}
+                        width={densityWidth}
+                        height={bandHeight}
+                        fill={strokeColor}
+                        opacity="0.45"
+                      />
+                      {/* Left-Anchored Liquidity Zone Tag */}
+                      {clampedTop + 14 <= mainChartHeight && (
+                        <g>
+                          <rect
+                            x={8}
+                            y={Math.max(2, clampedTop + (bandHeight - 15) / 2)}
+                            width={labelWidth}
+                            height={15}
+                            rx="2"
+                            fill={badgeBg}
+                            stroke={strokeColor}
+                            strokeWidth="0.7"
+                          />
+                          <text
+                            x={14}
+                            y={Math.max(2, clampedTop + (bandHeight - 15) / 2) + 10.5}
+                            fill={textColor}
+                            fontSize="9.5"
+                            fontFamily="JetBrains Mono, monospace"
+                            fontWeight="600"
+                          >
+                            {labelText}
+                          </text>
+                        </g>
+                      )}
+                    </g>
+                  );
+                })}
+              </g>
+            )}
+
+          {/* 4A-ter. SMART ANNOTATION: HORIZONTAL SUPPORT & RESISTANCE PIVOTS */}
+          {isSmartAnnotationActive &&
+            smartAnnotations &&
+            smartAnnotations.hasData &&
+            (smartLayerScope === 'ALL' || smartLayerScope === 'PIVOTS') && (
+              <g aria-label="Smart Annotation Support Resistance Pivots">
+                {smartAnnotations.pivotLevels.map((lvl) => {
+                  const yLvl = priceToY(lvl.price);
+                  if (!Number.isFinite(yLvl) || yLvl < 8 || yLvl > mainChartHeight - 8) return null;
+
+                  const strokeColor =
+                    lvl.role === 'RESISTANCE'
+                      ? 'rgba(251, 113, 133, 0.72)'
+                      : lvl.role === 'SUPPORT'
+                      ? 'rgba(52, 211, 153, 0.72)'
+                      : 'rgba(245, 158, 11, 0.78)';
+                  const labelFill =
+                    lvl.role === 'RESISTANCE'
+                      ? 'rgba(136, 19, 55, 0.88)'
+                      : lvl.role === 'SUPPORT'
+                      ? 'rgba(6, 78, 59, 0.88)'
+                      : 'rgba(120, 53, 15, 0.9)';
+                  const textFill =
+                    lvl.role === 'RESISTANCE'
+                      ? '#fecdd3'
+                      : lvl.role === 'SUPPORT'
+                      ? '#a7f3d0'
+                      : '#fde68a';
+
+                  // Offset pivot badge cleanly left of TP/SL tags when Trade Plan is also visible
+                  const badgeX =
+                    overlays.tradePlan && tradePlan
+                      ? Math.max(8, chartWidth - 215)
+                      : Math.max(8, chartWidth - 104);
+
+                  return (
+                    <g key={`smart-pivot-${lvl.id}`}>
+                      <line
+                        x1={0}
+                        y1={yLvl}
+                        x2={chartWidth}
+                        y2={yLvl}
+                        stroke={strokeColor}
+                        strokeWidth={lvl.id === 'P' ? '1.35' : '1.1'}
+                        strokeDasharray={lvl.id === 'P' ? '2 2' : '6 3'}
+                      />
+                      <rect
+                        x={badgeX}
+                        y={yLvl - 8}
+                        width={96}
+                        height={16}
+                        rx="2"
+                        fill={labelFill}
+                        stroke={strokeColor}
+                        strokeWidth="0.7"
+                      />
+                      <text
+                        x={badgeX + 48}
+                        y={yLvl + 3}
+                        fill={textFill}
+                        fontSize="9.5"
+                        fontFamily="JetBrains Mono, monospace"
+                        fontWeight="bold"
+                        textAnchor="middle"
+                      >
+                        {lvl.label}
+                      </text>
+                    </g>
+                  );
+                })}
+              </g>
+            )}
+
           {/* 4B. PRICE SERIES GLYPHS (Candles, Heikin Ashi, Line, Area, or Bars) */}
 
           {/* Area Chart Mode */}
@@ -1500,6 +2756,243 @@ export const CandleChart: React.FC<CandleChartProps> = ({
                 </g>
               );
             })}
+
+          {/* 4B-bis. SMART ANNOTATION: STRUCTURAL SWING HIGH / SWING LOW PIVOT MARKERS */}
+          {isSmartAnnotationActive &&
+            smartAnnotations &&
+            smartAnnotations.hasData &&
+            (smartLayerScope === 'ALL' || smartLayerScope === 'PIVOTS') && (
+              <g aria-label="Smart Annotation Swing Pivots">
+                {smartAnnotations.swingPivots.map((swing) => {
+                  if (swing.barIndex < startIndex || swing.barIndex >= endIndex) return null;
+                  const localIdx = swing.barIndex - startIndex;
+                  const x = localIdx * candleStep + candleStep / 2;
+                  const y = priceToY(swing.price);
+                  if (!Number.isFinite(y) || y < 2 || y > mainChartHeight - 2) return null;
+
+                  const isHigh = swing.type === 'SWING_HIGH';
+                  const markerColor = isHigh ? '#fb7185' : '#34d399';
+                  const pillBg = isHigh ? 'rgba(136, 19, 55, 0.92)' : 'rgba(6, 78, 59, 0.92)';
+                  const textColor = isHigh ? '#ffe4e6' : '#d1fae5';
+                  const badgeW = 68;
+                  const clampedX = Math.max(badgeW / 2 + 4, Math.min(chartWidth - badgeW / 2 - 4, x));
+
+                  const tipY = isHigh ? Math.max(18, y - 5) : Math.min(mainChartHeight - 18, y + 5);
+                  const badgeY = isHigh ? Math.max(2, tipY - 22) : Math.min(mainChartHeight - 17, tipY + 7);
+
+                  return (
+                    <g key={swing.id}>
+                      {/* Triangle Pivot Arrow Anchored to Candle Extremum */}
+                      <polygon
+                        points={
+                          isHigh
+                            ? `${x},${tipY} ${x - 4},${tipY - 6} ${x + 4},${tipY - 6}`
+                            : `${x},${tipY} ${x - 4},${tipY + 6} ${x + 4},${tipY + 6}`
+                        }
+                        fill={markerColor}
+                      />
+                      <rect
+                        x={clampedX - badgeW / 2}
+                        y={badgeY}
+                        width={badgeW}
+                        height={15}
+                        rx="2"
+                        fill={pillBg}
+                        stroke={markerColor}
+                        strokeWidth="0.8"
+                      />
+                      <text
+                        x={clampedX}
+                        y={badgeY + 10.5}
+                        fill={textColor}
+                        fontSize="9"
+                        fontFamily="JetBrains Mono, monospace"
+                        fontWeight="bold"
+                        textAnchor="middle"
+                      >
+                        {isHigh ? 'R' : 'S'} ${swing.price.toFixed(0)}
+                      </text>
+                    </g>
+                  );
+                })}
+              </g>
+            )}
+
+          {/* 4B-ter. NEWS CATALYST MACROECONOMIC EVENT MARKERS (FOMC / NFP / CPI / SHOCKS) */}
+          {showNewsCatalysts && newsCatalystData && newsCatalystData.hasData && (
+            <g aria-label="News Catalyst Chart Markers">
+              {newsCatalystData.markers.map((ev, idx) => {
+                if (ev.barIndex < startIndex || ev.barIndex >= endIndex) return null;
+                const localIdx = ev.barIndex - startIndex;
+                const x = localIdx * candleStep + candleStep / 2;
+                const isBull = ev.impactDirection === 'BULLISH';
+                const isBear = ev.impactDirection === 'BEARISH';
+                const strokeColor = isBull
+                  ? 'rgba(16, 185, 129, 0.72)'
+                  : isBear
+                  ? 'rgba(244, 63, 94, 0.72)'
+                  : 'rgba(56, 189, 248, 0.78)';
+                const bgFill = isBull
+                  ? 'rgba(6, 78, 59, 0.92)'
+                  : isBear
+                  ? 'rgba(136, 19, 55, 0.92)'
+                  : 'rgba(12, 74, 110, 0.92)';
+                const textFill = isBull ? '#a7f3d0' : isBear ? '#fecdd3' : '#bae6fd';
+                const tagW = Math.max(48, ev.shortTag.length * 6.5 + 14);
+                const clampedX = Math.max(tagW / 2 + 4, Math.min(chartWidth - tagW / 2 - 4, x));
+                const tierY = mainChartHeight - 25 - (idx % 2) * 19;
+
+                return (
+                  <g key={ev.id}>
+                    <title>
+                      {`${ev.shortTag} · ${ev.dateStr} — ${ev.title} (${ev.actualVsConsensus} · Bar ${ev.candleReturnPct >= 0 ? '+' : ''}${ev.candleReturnPct}%)`}
+                    </title>
+                    <line
+                      x1={x}
+                      y1={0}
+                      x2={x}
+                      y2={mainChartHeight}
+                      stroke={strokeColor}
+                      strokeWidth="1"
+                      strokeDasharray="3 3"
+                      opacity="0.7"
+                    />
+                    <polygon
+                      points={`${x},${mainChartHeight - 1} ${x - 4},${mainChartHeight - 5} ${x},${mainChartHeight - 9} ${x + 4},${mainChartHeight - 5}`}
+                      fill={strokeColor}
+                    />
+                    <rect
+                      x={clampedX - tagW / 2}
+                      y={tierY}
+                      width={tagW}
+                      height={15}
+                      rx="2"
+                      fill={bgFill}
+                      stroke={strokeColor}
+                      strokeWidth="0.8"
+                    />
+                    <text
+                      x={clampedX}
+                      y={tierY + 10.5}
+                      fill={textFill}
+                      fontSize="9"
+                      fontFamily="JetBrains Mono, monospace"
+                      fontWeight="bold"
+                      textAnchor="middle"
+                    >
+                      {ev.shortTag}
+                    </text>
+                  </g>
+                );
+              })}
+            </g>
+          )}
+
+          {/* 4B-quater. LIQUIDITY SWEEP WICK-ONLY STOP-HUNT MARKERS */}
+          {showLiquiditySweeps && liquiditySweepData && filteredLiquiditySweeps.length > 0 && (
+            <g aria-label="Liquidity Sweep Chart Markers">
+              {filteredLiquiditySweeps.map((sw) => {
+                if (sw.barIndex < startIndex || sw.barIndex >= endIndex) return null;
+                const localBarIdx = sw.barIndex - startIndex;
+                const xEnd = localBarIdx * candleStep + candleStep / 2;
+                const hasVisibleSwingOrigin =
+                  sw.sweptSwingBarIndex >= startIndex && sw.sweptSwingBarIndex < endIndex;
+                const xStart = hasVisibleSwingOrigin
+                  ? (sw.sweptSwingBarIndex - startIndex) * candleStep + candleStep / 2
+                  : Math.max(0, xEnd - Math.min(180, chartWidth * 0.35));
+
+                const ySwingLevel = priceToY(sw.sweptSwingPrice);
+                const ySweepExtreme = priceToY(sw.sweepExtremePrice);
+                if (!Number.isFinite(ySwingLevel) || !Number.isFinite(ySweepExtreme)) return null;
+                if (ySwingLevel < -10 || ySwingLevel > mainChartHeight + 10) return null;
+
+                const isBullSweep = sw.direction === 'BULLISH_SWEEP';
+                const accentColor = isBullSweep ? '#34d399' : '#fb7185';
+                const wickHighlightColor = '#fbbf24';
+                const badgeBg = isBullSweep ? 'rgba(6, 78, 59, 0.94)' : 'rgba(136, 19, 55, 0.94)';
+                const badgeText = isBullSweep ? '#d1fae5' : '#ffe4e6';
+                const badgeW = 92;
+                const badgeCenterX = Math.max(
+                  badgeW / 2 + 4,
+                  Math.min(chartWidth - badgeW / 2 - 4, xEnd)
+                );
+                const clampedExtremeY = Math.max(6, Math.min(mainChartHeight - 6, ySweepExtreme));
+                const badgeY = isBullSweep
+                  ? Math.min(mainChartHeight - 18, clampedExtremeY + 11)
+                  : Math.max(3, clampedExtremeY - 26);
+
+                return (
+                  <g key={sw.id}>
+                    <title>{sw.rationale}</title>
+                    {/* Horizontal Dashed Liquidity Pool Line from Prior Swing High/Low to Hunt Candle */}
+                    <line
+                      x1={xStart}
+                      y1={ySwingLevel}
+                      x2={xEnd}
+                      y2={ySwingLevel}
+                      stroke={accentColor}
+                      strokeWidth="1.2"
+                      strokeDasharray="3 2"
+                      opacity="0.85"
+                    />
+                    {/* Swept Prior Swing Origin Ring */}
+                    {hasVisibleSwingOrigin && (
+                      <circle
+                        cx={xStart}
+                        cy={ySwingLevel}
+                        r="3"
+                        fill="#0f172a"
+                        stroke={accentColor}
+                        strokeWidth="1.4"
+                      />
+                    )}
+                    {/* Highlighted Wick-Only Sweep Segment Extending Past Prior Swing */}
+                    <line
+                      x1={xEnd}
+                      y1={ySwingLevel}
+                      x2={xEnd}
+                      y2={clampedExtremeY}
+                      stroke={wickHighlightColor}
+                      strokeWidth="3"
+                      strokeLinecap="round"
+                    />
+                    {/* Sweep Diamond Flag */}
+                    <polygon
+                      points={
+                        isBullSweep
+                          ? `${xEnd},${clampedExtremeY + 3} ${xEnd - 4.5},${clampedExtremeY + 8} ${xEnd},${clampedExtremeY + 13} ${xEnd + 4.5},${clampedExtremeY + 8}`
+                          : `${xEnd},${clampedExtremeY - 3} ${xEnd - 4.5},${clampedExtremeY - 8} ${xEnd},${clampedExtremeY - 13} ${xEnd + 4.5},${clampedExtremeY - 8}`
+                      }
+                      fill={wickHighlightColor}
+                      stroke={accentColor}
+                      strokeWidth="0.9"
+                    />
+                    <rect
+                      x={badgeCenterX - badgeW / 2}
+                      y={badgeY}
+                      width={badgeW}
+                      height={15}
+                      rx="2"
+                      fill={badgeBg}
+                      stroke={wickHighlightColor}
+                      strokeWidth="0.8"
+                    />
+                    <text
+                      x={badgeCenterX}
+                      y={badgeY + 10.5}
+                      fill={badgeText}
+                      fontSize="8.5"
+                      fontFamily="JetBrains Mono, monospace"
+                      fontWeight="bold"
+                      textAnchor="middle"
+                    >
+                      {isBullSweep ? 'SWEEP LOW' : 'SWEEP HIGH'}
+                    </text>
+                  </g>
+                );
+              })}
+            </g>
+          )}
 
           {/* 4C. TRADE PLAN MARKER LEVELS */}
           {overlays.tradePlan && tradePlan && (
@@ -2022,6 +3515,47 @@ export const CandleChart: React.FC<CandleChartProps> = ({
           {overlays.bollinger && (
             <span className="flex items-center gap-1 text-cyan-400">
               <span className="w-2 h-0.5 bg-cyan-400"></span> Bollinger (20,2)
+            </span>
+          )}
+          {overlays.historicalAnalog && analogProjection && (
+            <span className="flex items-center gap-1 text-violet-300">
+              <span className="w-2.5 h-0.5 bg-violet-400"></span> Analog ({analogProjection.profile.shortLabel})
+            </span>
+          )}
+          {compareYearsEnabled &&
+            alignedYearComparisons.map((comp) => (
+              <span
+                key={`legend-cmp-${comp.year}`}
+                className="flex items-center gap-1"
+                style={{ color: comp.colorHex }}
+              >
+                <span className="w-2.5 h-0.5" style={{ backgroundColor: comp.colorHex }}></span>{' '}
+                Compare {comp.year} ({comp.summary.historicalReturnPct >= 0 ? '+' : ''}
+                {comp.summary.historicalReturnPct}%)
+              </span>
+            ))}
+          {isSmartAnnotationActive && smartAnnotations?.hasData && (
+            <>
+              {(smartLayerScope === 'ALL' || smartLayerScope === 'LIQUIDITY') && (
+                <span className="flex items-center gap-1 text-amber-300">
+                  <span className="w-2.5 h-2 bg-amber-500/30 border border-amber-400/60"></span> Liquidity Zones
+                </span>
+              )}
+              {(smartLayerScope === 'ALL' || smartLayerScope === 'PIVOTS') && (
+                <span className="flex items-center gap-1 text-emerald-300">
+                  <span className="w-2.5 h-0.5 bg-emerald-400"></span> S/R Pivots
+                </span>
+              )}
+            </>
+          )}
+          {showNewsCatalysts && (
+            <span className="flex items-center gap-1 text-sky-300">
+              <span className="w-2 h-2 rotate-45 bg-sky-400"></span> News Catalysts
+            </span>
+          )}
+          {showLiquiditySweeps && (
+            <span className="flex items-center gap-1 text-rose-300">
+              <span className="w-2.5 h-0.5 bg-amber-400"></span> Liquidity Sweeps
             </span>
           )}
         </div>

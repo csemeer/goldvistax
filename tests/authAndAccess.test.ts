@@ -1,4 +1,6 @@
 import assert from 'node:assert';
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   DEMO_PERSONAS,
   canAccessWorkspace,
@@ -108,11 +110,113 @@ async function testLogins() {
   const switchedGuest = logoutUser();
   assert.strictEqual(switchedGuest.role, 'GUEST');
   console.log('✓ Persona switcher verified.');
+}
 
+async function runExtendedAuthChecks() {
+  // Test 6: Persistent Sign-Up, Duplicate Guard, Password Verification & UID Continuity
+  console.log('Test 6: Credential Sign-Up, duplicate rejection & returning-user UID recovery...');
+  const uniqueEmail = `signup.trader.${Date.now()}@goldvista-test.io`;
+  const createdUser = await enrollNewCustomer({
+    email: uniqueEmail,
+    displayName: 'Priya Sharma',
+    password: 'StrongPassword#2026',
+    rejectDuplicate: true,
+    authProvider: 'email',
+    tradingProfile: {
+      primaryHorizon: 'SWING',
+      brokerName: 'IC Markets Global (Raw ECN)',
+      experienceLevel: 'ADVANCED',
+    },
+  });
+  assert.ok(createdUser.uid.startsWith('usr_new_'), 'Newly signed-up user should receive deterministic scoped UID');
+  assert.strictEqual(createdUser.displayName, 'Priya Sharma');
+
+  // Duplicate sign-up must be rejected cleanly
+  await assert.rejects(
+    () =>
+      enrollNewCustomer({
+        email: uniqueEmail.toUpperCase(),
+        displayName: 'Duplicate User',
+        password: 'AnotherPassword#2026',
+        rejectDuplicate: true,
+        authProvider: 'email',
+        tradingProfile: { primaryHorizon: 'INTRADAY', experienceLevel: 'NOVICE' },
+      }),
+    /already registered/i,
+    'Duplicate email sign-up must reject cleanly'
+  );
+
+  // Wrong password must be rejected
+  await assert.rejects(
+    () => loginWithEmail(uniqueEmail, 'WrongPassword123', { strictRegisteredOnly: true }),
+    /Incorrect password/i,
+    'Wrong password must be rejected'
+  );
+
+  // Unregistered email in strict sign-in mode must be rejected
+  await assert.rejects(
+    () => loginWithEmail('unknown.visitor@never-registered.io', 'Password123', { strictRegisteredOnly: true }),
+    /No account found/i,
+    'Unregistered email in strict Sign In mode must guide user to Sign Up'
+  );
+
+  // Sign out then Sign In with correct password recovers exact same UID and profile
+  const afterSignOut = logoutUser();
+  assert.strictEqual(afterSignOut.role, 'GUEST');
+
+  const signedBackIn = await loginWithEmail(uniqueEmail, 'StrongPassword#2026', { strictRegisteredOnly: true });
+  assert.strictEqual(signedBackIn.uid, createdUser.uid, 'Returning Sign In must recover exact original UID');
+  assert.strictEqual(signedBackIn.displayName, 'Priya Sharma');
+  assert.strictEqual(signedBackIn.tradingProfile?.primaryHorizon, 'SWING');
+  console.log('✓ Credential sign-up, duplicate rejection, and returning UID recovery verified.');
+
+  // Test 7: Multi-Device Sign-Out & Sign-Up UI Contract Checks
+  console.log('Test 7: Verifying Sign-Out & Sign-Up UI visibility across desktop/mobile components...');
+  const rootDir = process.cwd();
+  const authModalSrc = fs.readFileSync(path.join(rootDir, 'src/components/AuthModal.tsx'), 'utf8');
+  const navbarSrc = fs.readFileSync(path.join(rootDir, 'src/components/Navbar.tsx'), 'utf8');
+  const sidebarSrc = fs.readFileSync(path.join(rootDir, 'src/components/Sidebar.tsx'), 'utf8');
+  const landingSrc = fs.readFileSync(path.join(rootDir, 'src/components/LandingPage.tsx'), 'utf8');
+
+  assert.ok(
+    authModalSrc.includes('[isOpen, initialMode]') &&
+      authModalSrc.includes('setMode(initialMode)') &&
+      authModalSrc.includes('setEnrollStep(1)') &&
+      authModalSrc.includes('autoComplete={mode === \'ENROLL\' ? \'new-password\' : \'current-password\'}') &&
+      authModalSrc.includes('selectedExperience'),
+    'AuthModal must resync initialMode/enrollStep on open, render password fields, and expose experience selector'
+  );
+
+  assert.ok(
+    navbarSrc.includes('Sign Up') &&
+      navbarSrc.includes('Sign Out') &&
+      navbarSrc.includes("onOpenAuth('LOGIN')") &&
+      !navbarSrc.includes('hidden sm:inline\n                >\n                  Sign In'),
+    'Navbar must expose Sign In & Sign Up cleanly on all viewports and surface a direct Sign Out control'
+  );
+
+  assert.ok(
+    sidebarSrc.includes('Sign Out') &&
+      sidebarSrc.includes('Sign Up') &&
+      sidebarSrc.includes('Sign In') &&
+      sidebarSrc.includes('onLogout'),
+    'Sidebar & Mobile Drawer must expose Sign Out for logged-in users and Sign Up / Sign In for guests'
+  );
+
+  assert.ok(
+    landingSrc.includes('isAuthenticated') &&
+      landingSrc.includes('Sign Out') &&
+      landingSrc.includes('Sign Up') &&
+      landingSrc.includes('enrollPassword'),
+    'LandingPage must expose Sign Up with password, Sign In, and active-session Sign Out controls'
+  );
+  console.log('✓ Multi-device Sign-Out & Sign-Up UI contracts verified.');
   console.log('--- ALL AUTH & ACCESS TESTS PASSED CLEANLY ---');
 }
 
-testLogins().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+testLogins()
+  .then(() => runExtendedAuthChecks())
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });

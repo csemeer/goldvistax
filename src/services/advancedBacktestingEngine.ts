@@ -9,8 +9,9 @@
  * 3. Session-Calibrated Illustrative Liquidity Slippage Model.
  */
 
-import { BacktestTrade, Candle } from '../domain/types';
+import { BacktestRunResult, BacktestTrade, Candle } from '../domain/types';
 import { calculateEMA } from './indicators';
+import { AGGREGATED_BROKER_VENUES, BrokerVenueId } from './institutionalQueueEngine';
 
 export interface WalkForwardFoldResult {
   foldIndex: number;
@@ -435,3 +436,556 @@ export function runMonteCarloPermutation(
     methodologyNote: `Computed via ${iterations.toLocaleString()} Circular Block Bootstrap iterations (block length=${effBlock}) preserving return serial correlation. 95% CI max drawdown bound: ${p95}%.`,
   };
 }
+
+// ============================================================================
+// 4. Institutional L2 Order Book Depth & Backtest Execution Simulator
+// ============================================================================
+
+export type L2ExecutionMode = 'MARKET_SWEEP' | 'TWAP_SLICED' | 'LIMIT_PASSIVE';
+export type L2FeeTier = 'PRIME_INSTITUTIONAL' | 'ECN_PRO' | 'RETAIL_STANDARD';
+export type L2LiquiditySession =
+  | 'LONDON_NY_OVERLAP'
+  | 'NEW_YORK_AFTERNOON'
+  | 'ASIAN_SESSION'
+  | 'EVENT_SHOCK';
+
+export interface L2VenueSlice {
+  brokerId: BrokerVenueId;
+  shortLabel: string;
+  lots: number;
+  sharePct: number;
+}
+
+export interface L2OrderBookLevel {
+  level: number;
+  side: 'BID' | 'ASK';
+  price: number;
+  distanceFromMidPips: number;
+  sizeLots: number;
+  cumulativeLots: number;
+  venueBreakdown: L2VenueSlice[];
+  consumedLots: number;
+  isConsumedByOrder: boolean;
+}
+
+export interface L2OrderBookSnapshot {
+  midPrice: number;
+  bestBid: number;
+  bestAsk: number;
+  topOfBookSpreadPips: number;
+  sessionRegime: L2LiquiditySession;
+  depthMultiplier: number;
+  totalBidDepthLots: number;
+  totalAskDepthLots: number;
+  imbalanceRatio: number;
+  bids: L2OrderBookLevel[];
+  asks: L2OrderBookLevel[];
+}
+
+export interface L2TradeExecutionImpact {
+  tradeId: string;
+  direction: 'BUY' | 'SELL';
+  lots: number;
+  entryPrice: number;
+  vwapEntryPrice: number;
+  slippagePips: number;
+  slippageCostUsd: number;
+  commissionCostUsd: number;
+  totalCostUsd: number;
+  grossTradePnlUsd: number;
+  l2AdjustedNetPnlUsd: number;
+  levelsSwept: number;
+}
+
+export interface L2ExecutionSimulatorReport {
+  strategyId: string;
+  strategyName: string;
+  executionMode: L2ExecutionMode;
+  feeTier: L2FeeTier;
+  sessionRegime: L2LiquiditySession;
+  evaluatedLotSize: number;
+  isOrderSizeOverridden: boolean;
+  vwapFillPrice: number;
+  referenceTopPrice: number;
+  halfSpreadPips: number;
+  marketImpactPips: number;
+  slippagePips: number;
+  slippageBps: number;
+  bookDepthConsumedLevels: number;
+  marketImpactRatioPct: number;
+  ecnClearingFeePerLot: number;
+  exchangeFeePerLot: number;
+  commissionPerLotRoundTurn: number;
+  commissionDollarsPerTrade: number;
+  slippageDollarsPerTrade: number;
+  grossTradeCount: number;
+  totalLotsTraded: number;
+  totalSlippageCostUsd: number;
+  totalCommissionCostUsd: number;
+  totalExecutionDragUsd: number;
+  grossPnlUsd: number;
+  netAdjustedPnlUsd: number;
+  grossProfitFactor: number;
+  adjustedProfitFactor: number;
+  adjustedWinRatePct: number;
+  efficiencyRetentionPct: number;
+  recommendedExecutionMode: L2ExecutionMode;
+  feeBreakdown: {
+    clearingFeeUsd: number;
+    exchangeFeeUsd: number;
+    passiveRebateUsd: number;
+  };
+  tradeExecutionImpacts: L2TradeExecutionImpact[];
+}
+
+const SESSION_L2_CONFIG: Record<
+  L2LiquiditySession,
+  { topSpreadPips: number; depthFactor: number; levelStepDollars: number }
+> = {
+  LONDON_NY_OVERLAP: { topSpreadPips: 18, depthFactor: 1.35, levelStepDollars: 0.12 },
+  NEW_YORK_AFTERNOON: { topSpreadPips: 24, depthFactor: 1.0, levelStepDollars: 0.14 },
+  ASIAN_SESSION: { topSpreadPips: 30, depthFactor: 0.72, levelStepDollars: 0.18 },
+  EVENT_SHOCK: { topSpreadPips: 52, depthFactor: 0.34, levelStepDollars: 0.28 },
+};
+
+const FEE_SCHEDULE_CONFIG: Record<
+  L2FeeTier,
+  { ecnClearingPerSide: number; exchangeFeePerSide: number; passiveMakerRebatePerSide: number }
+> = {
+  PRIME_INSTITUTIONAL: {
+    ecnClearingPerSide: 1.6,
+    exchangeFeePerSide: 0.9,
+    passiveMakerRebatePerSide: 0.4,
+  },
+  ECN_PRO: {
+    ecnClearingPerSide: 2.4,
+    exchangeFeePerSide: 1.1,
+    passiveMakerRebatePerSide: 0.25,
+  },
+  RETAIL_STANDARD: {
+    ecnClearingPerSide: 4.5,
+    exchangeFeePerSide: 1.5,
+    passiveMakerRebatePerSide: 0.0,
+  },
+};
+
+const BASE_L2_LEVEL_WEIGHTS = [3.8, 6.4, 9.5, 13.0, 16.5, 19.0, 22.5, 26.0];
+
+function round2(n: number): number {
+  return Number(n.toFixed(2));
+}
+
+function buildVenueSplit(totalLots: number, levelIdx: number, side: 'BID' | 'ASK'): L2VenueSlice[] {
+  let assigned = 0;
+  return AGGREGATED_BROKER_VENUES.map((venue, idx) => {
+    const tilt =
+      idx === 0
+        ? 1 + (levelIdx % 2 === 0 ? 0.04 : -0.02)
+        : idx === 1
+        ? 1 + (side === 'BID' ? 0.02 : -0.02)
+        : 1;
+    const isLast = idx === AGGREGATED_BROKER_VENUES.length - 1;
+    const rawLots = isLast
+      ? Math.max(0.1, Number((totalLots - assigned).toFixed(2)))
+      : Number((totalLots * venue.marketShareWeight * tilt).toFixed(2));
+    assigned += rawLots;
+    const sharePct = totalLots > 0 ? Number(((rawLots / totalLots) * 100).toFixed(1)) : 0;
+    return {
+      brokerId: venue.brokerId,
+      shortLabel: venue.shortLabel,
+      lots: rawLots,
+      sharePct,
+    };
+  });
+}
+
+/**
+ * Builds an aggregated multi-venue Institutional Level 2 (L2) Order Book ladder
+ * anchored around midPrice across CME Globex, LMAX Prime, Saxo Prime, and Currenex ECN.
+ */
+export function buildInstitutionalL2OrderBook(params: {
+  midPrice?: number;
+  sessionRegime?: L2LiquiditySession;
+  depthMultiplier?: number;
+  orderLotsToConsume?: number;
+  consumeSide?: 'BUY' | 'SELL';
+  levels?: number;
+} = {}): L2OrderBookSnapshot {
+  const midPrice =
+    Number.isFinite(params.midPrice) && (params.midPrice ?? 0) > 0 ? Number(params.midPrice) : 3950.0;
+  const sessionRegime: L2LiquiditySession = params.sessionRegime ?? 'LONDON_NY_OVERLAP';
+  const depthMultiplier = Math.max(0.25, Math.min(3.0, params.depthMultiplier ?? 1.0));
+  const orderLots = Math.max(0, params.orderLotsToConsume ?? 1.0);
+  const consumeSide: 'BUY' | 'SELL' = params.consumeSide ?? 'BUY';
+  const levels = Math.max(4, Math.min(10, Math.round(params.levels ?? 8)));
+
+  const cfg = SESSION_L2_CONFIG[sessionRegime] ?? SESSION_L2_CONFIG.LONDON_NY_OVERLAP;
+  const halfSpreadDollars = (cfg.topSpreadPips * 0.01) / 2;
+  const bestBid = round2(midPrice - halfSpreadDollars);
+  const bestAsk = round2(midPrice + halfSpreadDollars);
+
+  const buildSide = (side: 'BID' | 'ASK'): L2OrderBookLevel[] => {
+    const out: L2OrderBookLevel[] = [];
+    let cumulativeLots = 0;
+    let remainingToConsume =
+      (side === 'ASK' && consumeSide === 'BUY') || (side === 'BID' && consumeSide === 'SELL')
+        ? orderLots
+        : 0;
+
+    for (let i = 0; i < levels; i++) {
+      const baseWeight = BASE_L2_LEVEL_WEIGHTS[i] ?? 26.0 + (i - 7) * 3.5;
+      // Mild realistic bid/ask asymmetry across levels
+      const sideSkew = side === 'BID' ? 1.03 : 0.98;
+      const sizeLots = Number((baseWeight * cfg.depthFactor * depthMultiplier * sideSkew).toFixed(2));
+      cumulativeLots = Number((cumulativeLots + sizeLots).toFixed(2));
+
+      const offsetDollars = i * cfg.levelStepDollars * (1 + i * 0.06);
+      const price =
+        side === 'ASK'
+          ? round2(bestAsk + offsetDollars)
+          : round2(Math.max(0.01, bestBid - offsetDollars));
+      const distanceFromMidPips = Number((Math.abs(price - midPrice) / 0.01).toFixed(1));
+
+      const consumedLots =
+        remainingToConsume > 0 ? Number(Math.min(sizeLots, remainingToConsume).toFixed(2)) : 0;
+      remainingToConsume = Number(Math.max(0, remainingToConsume - consumedLots).toFixed(2));
+
+      out.push({
+        level: i + 1,
+        side,
+        price,
+        distanceFromMidPips,
+        sizeLots,
+        cumulativeLots,
+        venueBreakdown: buildVenueSplit(sizeLots, i, side),
+        consumedLots,
+        isConsumedByOrder: consumedLots > 0,
+      });
+    }
+    return out;
+  };
+
+  const bids = buildSide('BID');
+  const asks = buildSide('ASK');
+  const totalBidDepthLots = Number((bids[bids.length - 1]?.cumulativeLots ?? 0).toFixed(2));
+  const totalAskDepthLots = Number((asks[asks.length - 1]?.cumulativeLots ?? 0).toFixed(2));
+  const imbalanceRatio =
+    totalAskDepthLots > 0 ? Number((totalBidDepthLots / totalAskDepthLots).toFixed(2)) : 1.0;
+
+  return {
+    midPrice: round2(midPrice),
+    bestBid,
+    bestAsk,
+    topOfBookSpreadPips: cfg.topSpreadPips,
+    sessionRegime,
+    depthMultiplier,
+    totalBidDepthLots,
+    totalAskDepthLots,
+    imbalanceRatio,
+    bids,
+    asks,
+  };
+}
+
+interface L2WalkResult {
+  vwapFillPrice: number;
+  referenceTopPrice: number;
+  halfSpreadPips: number;
+  marketImpactPips: number;
+  roundTurnSlippagePips: number;
+  levelsSwept: number;
+  marketImpactRatioPct: number;
+}
+
+function simulateOrderBookWalk(
+  book: L2OrderBookSnapshot,
+  lots: number,
+  side: 'BUY' | 'SELL',
+  executionMode: L2ExecutionMode
+): L2WalkResult {
+  const ladder = side === 'BUY' ? book.asks : book.bids;
+  const referenceTopPrice = ladder[0]?.price ?? (side === 'BUY' ? book.bestAsk : book.bestBid);
+  const totalSideDepth = side === 'BUY' ? book.totalAskDepthLots : book.totalBidDepthLots;
+  const halfSpreadPips = Number((book.topOfBookSpreadPips / 2).toFixed(2));
+  const safeLots = Math.max(0.01, lots);
+
+  const sweepSingleClip = (clipLots: number): { vwap: number; impactPips: number; levelsSwept: number } => {
+    let remaining = clipLots;
+    let notionalSum = 0;
+    let levelsSwept = 0;
+
+    for (const lvl of ladder) {
+      if (remaining <= 0) break;
+      const take = Math.min(remaining, lvl.sizeLots);
+      if (take > 0) {
+        notionalSum += take * lvl.price;
+        remaining -= take;
+        levelsSwept = lvl.level;
+      }
+    }
+
+    // Overflow beyond visible 8-level L2 depth incurs progressive sweep penalty
+    if (remaining > 0.0001) {
+      const deepest = ladder[ladder.length - 1];
+      const overflowPenaltyDollars = Math.min(2.5, (remaining / Math.max(1, deepest.sizeLots)) * 0.48);
+      const overflowPrice =
+        side === 'BUY'
+          ? deepest.price + overflowPenaltyDollars
+          : Math.max(0.01, deepest.price - overflowPenaltyDollars);
+      notionalSum += remaining * overflowPrice;
+      levelsSwept = ladder.length;
+    }
+
+    const vwap = round2(notionalSum / clipLots);
+    const impactPips = Number((Math.abs(vwap - referenceTopPrice) / 0.01).toFixed(2));
+    return { vwap, impactPips, levelsSwept };
+  };
+
+  let vwapFillPrice = referenceTopPrice;
+  let marketImpactPips = 0;
+  let roundTurnSlippagePips = 0;
+  let levelsSwept = 1;
+
+  if (executionMode === 'MARKET_SWEEP') {
+    const res = sweepSingleClip(safeLots);
+    vwapFillPrice = res.vwap;
+    marketImpactPips = res.impactPips;
+    levelsSwept = res.levelsSwept;
+    // Round-turn crossing: full spread + entry impact + 85% symmetric exit sweep impact
+    roundTurnSlippagePips = Number((book.topOfBookSpreadPips + marketImpactPips * 1.85).toFixed(2));
+  } else if (executionMode === 'TWAP_SLICED') {
+    // Splits parent ticket into scheduled clips so top-of-book depth partially replenishes
+    const numSlices = Math.max(3, Math.min(10, Math.ceil(safeLots / 2.2)));
+    const childClip = Number((safeLots / numSlices).toFixed(2));
+    const res = sweepSingleClip(childClip);
+    vwapFillPrice = res.vwap;
+    // Slight residual schedule drift when executing over multiple slices
+    const driftPips = Number((res.impactPips * 0.35 + (safeLots > 4 ? 0.5 : 0.2)).toFixed(2));
+    marketImpactPips = Number((res.impactPips + driftPips * 0.25).toFixed(2));
+    levelsSwept = res.levelsSwept;
+    roundTurnSlippagePips = Number((book.topOfBookSpreadPips * 0.78 + marketImpactPips * 1.35).toFixed(2));
+  } else {
+    // LIMIT_PASSIVE: posts passively at top of book; avoids most spread crossing, minimal adverse selection
+    const adverseFillFraction = Math.min(0.35, 0.12 + (safeLots / Math.max(10, totalSideDepth)) * 0.5);
+    const res = sweepSingleClip(safeLots * adverseFillFraction);
+    vwapFillPrice = round2(
+      side === 'BUY'
+        ? book.bestBid + (res.vwap - book.bestBid) * 0.25
+        : book.bestAsk - (book.bestAsk - res.vwap) * 0.25
+    );
+    marketImpactPips = Number((res.impactPips * 0.35).toFixed(2));
+    levelsSwept = Math.max(1, Math.min(res.levelsSwept, 2));
+    roundTurnSlippagePips = Number((book.topOfBookSpreadPips * 0.22 + marketImpactPips).toFixed(2));
+  }
+
+  const marketImpactRatioPct =
+    totalSideDepth > 0 ? Number(Math.min(100, (safeLots / totalSideDepth) * 100).toFixed(2)) : 0;
+
+  return {
+    vwapFillPrice,
+    referenceTopPrice,
+    halfSpreadPips,
+    marketImpactPips,
+    roundTurnSlippagePips,
+    levelsSwept,
+    marketImpactRatioPct,
+  };
+}
+
+/**
+ * Simulates Institutional Level-2 Order Book Slippage & Tiered Commission Costs
+ * across all trades of a selected BacktestRunResult.
+ */
+export function simulateBacktestL2Execution(
+  backtestResult: BacktestRunResult,
+  options: {
+    executionMode?: L2ExecutionMode;
+    feeTier?: L2FeeTier;
+    sessionRegime?: L2LiquiditySession;
+    midPriceOverride?: number;
+    orderSizeOverrideLots?: number | null;
+    depthMultiplier?: number;
+  } = {}
+): L2ExecutionSimulatorReport {
+  const executionMode: L2ExecutionMode = options.executionMode ?? 'MARKET_SWEEP';
+  const feeTier: L2FeeTier = options.feeTier ?? 'ECN_PRO';
+  const sessionRegime: L2LiquiditySession = options.sessionRegime ?? 'LONDON_NY_OVERLAP';
+  const depthMultiplier = Math.max(0.25, Math.min(3.0, options.depthMultiplier ?? 1.0));
+  const trades: BacktestTrade[] = Array.isArray(backtestResult?.trades) ? backtestResult.trades : [];
+
+  const avgStrategyLots =
+    trades.length > 0
+      ? Number((trades.reduce((s, t) => s + (t.lots || 1), 0) / trades.length).toFixed(2))
+      : 1.0;
+
+  const isOrderSizeOverridden =
+    options.orderSizeOverrideLots !== undefined &&
+    options.orderSizeOverrideLots !== null &&
+    Number.isFinite(options.orderSizeOverrideLots) &&
+    options.orderSizeOverrideLots > 0;
+
+  const evaluatedLotSize = isOrderSizeOverridden
+    ? Number(options.orderSizeOverrideLots!.toFixed(2))
+    : avgStrategyLots;
+
+  const samplePrice =
+    Number.isFinite(options.midPriceOverride) && (options.midPriceOverride ?? 0) > 0
+      ? Number(options.midPriceOverride)
+      : trades.length > 0
+      ? trades[trades.length - 1].entryPrice
+      : 3950.0;
+
+  const bookSnapshot = buildInstitutionalL2OrderBook({
+    midPrice: samplePrice,
+    sessionRegime,
+    depthMultiplier,
+    orderLotsToConsume: evaluatedLotSize,
+    consumeSide: 'BUY',
+  });
+
+  const feeCfg = FEE_SCHEDULE_CONFIG[feeTier] ?? FEE_SCHEDULE_CONFIG.ECN_PRO;
+  const passiveRebatePerSide = executionMode === 'LIMIT_PASSIVE' ? feeCfg.passiveMakerRebatePerSide : 0;
+  const netEcnClearingPerSide = Math.max(0.5, Number((feeCfg.ecnClearingPerSide - passiveRebatePerSide).toFixed(2)));
+  const commissionPerLotRoundTurn = Number(((netEcnClearingPerSide + feeCfg.exchangeFeePerSide) * 2).toFixed(2));
+
+  // Representative L2 book walk for the active lot sizing
+  const repWalk = simulateOrderBookWalk(bookSnapshot, evaluatedLotSize, 'BUY', executionMode);
+  const slippageBps = samplePrice > 0 ? Number((((repWalk.roundTurnSlippagePips * 0.01) / samplePrice) * 10000).toFixed(2)) : 0;
+
+  let grossPnlAccum = 0;
+  let totalSlippageAccum = 0;
+  let totalCommissionAccum = 0;
+  let totalLotsTraded = 0;
+  let clearingFeeAccum = 0;
+  let exchangeFeeAccum = 0;
+  let passiveRebateAccum = 0;
+
+  let grossWins = 0;
+  let grossLosses = 0;
+  let adjWins = 0;
+  let adjLosses = 0;
+  let adjWinCount = 0;
+
+  const tradeExecutionImpacts: L2TradeExecutionImpact[] = trades.map((tr) => {
+    const lots = isOrderSizeOverridden ? evaluatedLotSize : Math.max(0.01, tr.lots || 1.0);
+    const tradeSide: 'BUY' | 'SELL' = tr.direction === 'SELL' ? 'SELL' : 'BUY';
+    const dirFactor = tradeSide === 'SELL' ? -1 : 1;
+    // Scale gross move proportionally if lot override is active
+    const tradeRawPriceDiff = (tr.exitPrice - tr.entryPrice) * dirFactor;
+    const grossTradePnlUsd = round2(tradeRawPriceDiff * lots * 100);
+
+    const walk = simulateOrderBookWalk(bookSnapshot, lots, tradeSide, executionMode);
+    // 1 pip on XAU/USD = $0.01 * 100 oz = $1.00 per standard lot
+    const slippageCostUsd = round2(walk.roundTurnSlippagePips * lots * 1.0);
+    const commissionCostUsd = round2(commissionPerLotRoundTurn * lots);
+    const totalCostUsd = round2(slippageCostUsd + commissionCostUsd);
+    const l2AdjustedNetPnlUsd = round2(grossTradePnlUsd - totalCostUsd);
+
+    grossPnlAccum += grossTradePnlUsd;
+    totalSlippageAccum += slippageCostUsd;
+    totalCommissionAccum += commissionCostUsd;
+    totalLotsTraded += lots;
+
+    clearingFeeAccum += feeCfg.ecnClearingPerSide * 2 * lots;
+    exchangeFeeAccum += feeCfg.exchangeFeePerSide * 2 * lots;
+    passiveRebateAccum += passiveRebatePerSide * 2 * lots;
+
+    if (grossTradePnlUsd > 0) grossWins += grossTradePnlUsd;
+    else grossLosses += Math.abs(grossTradePnlUsd);
+
+    if (l2AdjustedNetPnlUsd > 0) {
+      adjWins += l2AdjustedNetPnlUsd;
+      adjWinCount++;
+    } else {
+      adjLosses += Math.abs(l2AdjustedNetPnlUsd);
+    }
+
+    return {
+      tradeId: tr.id,
+      direction: tradeSide,
+      lots,
+      entryPrice: tr.entryPrice,
+      vwapEntryPrice: walk.vwapFillPrice,
+      slippagePips: walk.roundTurnSlippagePips,
+      slippageCostUsd,
+      commissionCostUsd,
+      totalCostUsd,
+      grossTradePnlUsd,
+      l2AdjustedNetPnlUsd,
+      levelsSwept: walk.levelsSwept,
+    };
+  });
+
+  const grossPnlUsd = round2(grossPnlAccum);
+  const totalSlippageCostUsd = round2(totalSlippageAccum);
+  const totalCommissionCostUsd = round2(totalCommissionAccum);
+  const totalExecutionDragUsd = round2(totalSlippageCostUsd + totalCommissionCostUsd);
+  // Guarantee exact net accounting identity: grossPnlUsd - totalExecutionDragUsd === netAdjustedPnlUsd
+  const netAdjustedPnlUsd = round2(grossPnlUsd - totalExecutionDragUsd);
+
+  const grossProfitFactor =
+    grossLosses > 0 ? round2(grossWins / grossLosses) : grossWins > 0 ? 9.99 : 0;
+  const adjustedProfitFactor =
+    adjLosses > 0 ? round2(adjWins / adjLosses) : adjWins > 0 ? 9.99 : 0;
+  const adjustedWinRatePct =
+    trades.length > 0 ? Number(((adjWinCount / trades.length) * 100).toFixed(1)) : 0;
+
+  const efficiencyRetentionPct =
+    grossPnlUsd > 0
+      ? Number(Math.max(-100, Math.min(100, (netAdjustedPnlUsd / grossPnlUsd) * 100)).toFixed(1))
+      : netAdjustedPnlUsd >= 0
+      ? 100
+      : 0;
+
+  const recommendedExecutionMode: L2ExecutionMode =
+    evaluatedLotSize >= 8 || sessionRegime === 'EVENT_SHOCK'
+      ? 'TWAP_SLICED'
+      : evaluatedLotSize <= 2.5
+      ? 'LIMIT_PASSIVE'
+      : 'MARKET_SWEEP';
+
+  const commissionDollarsPerTrade = round2(commissionPerLotRoundTurn * evaluatedLotSize);
+  const slippageDollarsPerTrade = round2(repWalk.roundTurnSlippagePips * evaluatedLotSize * 1.0);
+
+  return {
+    strategyId: backtestResult?.strategyId || 'UNKNOWN',
+    strategyName: backtestResult?.strategyName || 'Quantitative Strategy',
+    executionMode,
+    feeTier,
+    sessionRegime,
+    evaluatedLotSize,
+    isOrderSizeOverridden,
+    vwapFillPrice: repWalk.vwapFillPrice,
+    referenceTopPrice: repWalk.referenceTopPrice,
+    halfSpreadPips: repWalk.halfSpreadPips,
+    marketImpactPips: repWalk.marketImpactPips,
+    slippagePips: repWalk.roundTurnSlippagePips,
+    slippageBps,
+    bookDepthConsumedLevels: repWalk.levelsSwept,
+    marketImpactRatioPct: repWalk.marketImpactRatioPct,
+    ecnClearingFeePerLot: netEcnClearingPerSide,
+    exchangeFeePerLot: feeCfg.exchangeFeePerSide,
+    commissionPerLotRoundTurn,
+    commissionDollarsPerTrade,
+    slippageDollarsPerTrade,
+    grossTradeCount: trades.length,
+    totalLotsTraded: round2(totalLotsTraded),
+    totalSlippageCostUsd,
+    totalCommissionCostUsd,
+    totalExecutionDragUsd,
+    grossPnlUsd,
+    netAdjustedPnlUsd,
+    grossProfitFactor,
+    adjustedProfitFactor,
+    adjustedWinRatePct,
+    efficiencyRetentionPct,
+    recommendedExecutionMode,
+    feeBreakdown: {
+      clearingFeeUsd: round2(clearingFeeAccum),
+      exchangeFeeUsd: round2(exchangeFeeAccum),
+      passiveRebateUsd: round2(passiveRebateAccum),
+    },
+    tradeExecutionImpacts,
+  };
+}
+
